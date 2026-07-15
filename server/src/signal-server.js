@@ -57,26 +57,32 @@ class Peer {
       return;
     }
 
-    logger.debug({ type: msg.type }, 'Received signal message');
+    logger.info(
+      { type: msg.type, roomId: msg.payload?.roomId, from: msg.from, to: msg.to },
+      'Received signal message');
 
-    switch (msg.type) {
-      case 'JOIN_ROOM':
-        await this.handleJoinRoom(msg);
-        break;
-      case 'OFFER':
-      case 'ANSWER':
-      case 'ICE_CANDIDATE':
-        await this.handleRelay(msg);
-        break;
-      case 'MOUSE_EVENT':
-      case 'KEY_EVENT':
-        await this.handleControlCommand(msg);
-        break;
-      case 'LEAVE_ROOM':
-        this.handleLeave();
-        break;
-      default:
-        logger.warn({ unknownType: msg.type }, 'Unknown message type');
+    try {
+      switch (msg.type) {
+        case 'JOIN_ROOM':
+          await this.handleJoinRoom(msg);
+          break;
+        case 'OFFER':
+        case 'ANSWER':
+        case 'ICE_CANDIDATE':
+          await this.handleRelay(msg);
+          break;
+        case 'MOUSE_EVENT':
+        case 'KEY_EVENT':
+          await this.handleControlCommand(msg);
+          break;
+        case 'LEAVE_ROOM':
+          this.handleLeave();
+          break;
+        default:
+          logger.warn({ unknownType: msg.type }, 'Unknown message type');
+      }
+    } catch (err) {
+      logger.error({ err, type: msg.type }, 'Error while handling message');
     }
   }
 
@@ -114,10 +120,31 @@ class Peer {
     }
     roomPeers.get(roomId).add(this);
 
-    logger.info({ roomId, userId: decoded.userId, role: decoded.role }, `Peer joined room`);
+    logger.info(
+      { roomId, userId: decoded.userId, role: decoded.role, peerCount: roomPeers.get(roomId).size },
+      `Peer joined room`);
+
+    const members = Array.from(roomPeers.get(roomId))
+      .filter((p) => p.user)
+      .map((p) => ({ userId: p.user.userId, role: p.user.role }));
+    logger.info({ roomId, members }, 'Current room members');
+
+    // Notify the other peers in the room that a new peer joined, so a
+    // controller can (re)negotiate an offer to a newly arrived viewer.
+    this.broadcastToRoom(roomId, {
+      type: 'PEER_JOINED',
+      payload: { userId: decoded.userId, role: decoded.role },
+    });
+    logger.info({ roomId, userId: decoded.userId, role: decoded.role }, 'Broadcast PEER_JOINED to others');
 
     // Initialize mediasoup router for this room
-    await mediasoupHandler.getOrCreateRouter(roomId);
+    try {
+      await mediasoupHandler.getOrCreateRouter(roomId);
+    } catch (err) {
+      logger.error({ err, roomId }, 'Failed to create/get router');
+      this.send({ type: 'AUTH_ERROR', payload: { message: 'Server media initialization failed' } });
+      return;
+    }
 
     // Send router capabilities to this peer
     if (!this.sentCapabilities) {
@@ -131,9 +158,9 @@ class Peer {
               routerRtpCapabilities: firstRouter.rtpCapabilities,
               roomId,
               role: decoded.role,
-              peers: Array.from(roomPeers.get(roomId)
+              peers: Array.from(roomPeers.get(roomId))
                 .filter(p => p !== this && p.user)
-                .map(p => ({ userId: p.user.userId, role: p.user.role }))),
+                .map(p => ({ userId: p.user.userId, role: p.user.role })),
             },
           });
           this.sentCapabilities = true;
@@ -160,9 +187,9 @@ class Peer {
       // Inject sender ID so receiver can route ICE candidates back
       const enriched = { ...msg, from: this.user.userId };
       target.send(enriched);
-      logger.debug({ from: this.user.userId, to, type: msg.type }, 'Message relayed');
+      logger.info({ from: this.user.userId, to, type: msg.type }, 'Message relayed');
     } else {
-      logger.warn({ to, roomId }, 'Target peer not found');
+      logger.warn({ to, roomId, type: msg.type }, 'Target peer not found — cannot relay');
       this.send({ type: 'AUTH_ERROR', payload: { message: 'Target peer not found' } });
     }
   }
@@ -254,21 +281,31 @@ class Peer {
  * @param {import('http').Server} httpServer
  */
 export function setupSignalServer(httpServer) {
-  const wss = new WebSocketServer({ server: httpServer, path: '/signal' });
+  // NOTE: we deliberately do NOT pass `path: '/signal'`. Some WebSocket
+  // clients (web_socket_channel on Flutter) append a `#` fragment to the
+  // upgrade request URI (e.g. `ws://host:3000/signal#`), and `ws`'s exact
+  // path match would then reject it with HTTP 404. This is a dedicated
+  // signaling server with no other WebSocket endpoints, so accepting all
+  // upgrade requests on this port is safe.
+  const wss = new WebSocketServer({ server: httpServer });
 
   wss.on('connection', (ws, req) => {
+    logger.info({ remote: req.socket.remoteAddress }, 'New WebSocket connection');
     const peer = new Peer(ws);
 
     ws.on('message', (raw) => {
       peer.handleMessage(raw.toString());
     });
 
-    ws.on('close', () => {
+    ws.on('close', (code, reason) => {
+      logger.info(
+        { code, reason: reason?.toString(), userId: peer.user?.userId },
+        'WebSocket closed');
       peer.handleLeave();
     });
 
     ws.on('error', (err) => {
-      logger.error({ err }, 'WebSocket error');
+      logger.error({ err, userId: peer.user?.userId }, 'WebSocket error');
     });
 
     // Heartbeat / ping
@@ -293,6 +330,6 @@ export function setupSignalServer(httpServer) {
     clearInterval(heartbeat);
   });
 
-  logger.info('WebSocket signal server listening on /signal');
+  logger.info('WebSocket signal server listening (accepts upgrades on any path)');
   return wss;
 }

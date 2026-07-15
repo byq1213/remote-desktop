@@ -14,7 +14,6 @@
 library;
 
 import 'dart:async';
-import 'dart:convert';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 
 import '../models/room.dart';
@@ -54,16 +53,40 @@ class ConnectionManager {
   MediaStream? _remoteStream;
   MediaStream? get remoteStream => _remoteStream;
 
+  /// Local (controller) screen-capture stream, for preview.
+  MediaStream? get localStream => _peer.localStream;
+
+  /// Called when the remote stream becomes available (viewer side).
+  Function(MediaStream)? onRemoteStreamUpdated;
+
+  /// Called when the local screen-capture stream is ready (controller side).
+  Function(MediaStream)? onLocalStreamUpdated;
+
+  /// Called when screen capture fails to start (e.g. permission denied).
+  Function(String)? onCaptureError;
+
+  /// Build a clean WebSocket URL from a base HTTP(S) URL, stripping any
+  /// fragment, query string, or trailing slash that could break the
+  /// server's exact `/signal` path match.
+  static String _buildWsUrl(String base) {
+    var s = base.trim();
+    final hash = s.indexOf('#');
+    if (hash != -1) s = s.substring(0, hash);
+    final q = s.indexOf('?');
+    if (q != -1) s = s.substring(0, q);
+    while (s.endsWith('/')) s = s.substring(0, s.length - 1);
+    s = s.replaceAll('http://', 'ws://').replaceAll('https://', 'wss://');
+    if (!s.endsWith('/signal')) s = '$s/signal';
+    return s;
+  }
+
   ConnectionManager({
     required this.room,
     required this.serverBaseUrl,
     required this.token,
   }) {
     // Derive WS URL: http://host:3000 → ws://host:3000/signal
-    final wsUrl = serverBaseUrl
-        .replaceAll('http://', 'ws://')
-        .replaceAll('https://', 'wss://')
-        + '/signal';
+    final wsUrl = _buildWsUrl(serverBaseUrl);
     _signal = SignalClient(wsUrl);
     _peer = PeerManager();
 
@@ -73,6 +96,11 @@ class ConnectionManager {
     // Connect ICE candidate forwarding
     _peer.setIceCallback(_onLocalIceCandidate);
   }
+
+  /// True once the controller's local screen-capture stream has been added
+  /// to the PeerConnection. Offers must only be created after this is true,
+  /// otherwise the SDP would contain no media tracks.
+  bool _screenCaptureReady = false;
 
   void addStateListener(Function(ConnectionState) listener) {
     _stateListeners.add(listener);
@@ -101,8 +129,14 @@ class ConnectionManager {
     _reconnectAttempts = 0;
 
     try {
-      // Connect WebSocket with the pre-obtained JWT token
-      await _signal.connect(token, room.id, room.role);
+      // Initialize PeerConnection BEFORE connecting WebSocket so that
+      // incoming offers/answers/candidates can be processed immediately.
+      await _peer.initialize(
+        iceServers: [
+          {'urls': ['stun:stun.l.google.com:19302']},
+        ],
+        isController: room.role == 'controller',
+      );
 
       // Setup role-specific resources
       if (room.role == 'controller') {
@@ -110,6 +144,9 @@ class ConnectionManager {
       } else {
         _setupViewer();
       }
+
+      // Connect WebSocket with the pre-obtained JWT token
+      await _signal.connect(token, room.id, room.role);
 
       _notifyState(ConnectionState.connected);
       return true;
@@ -129,39 +166,28 @@ class ConnectionManager {
   // ========== Controller Side ==========
 
   void _setupController() {
-    _peer.initialize(
-      iceServers: [
-        {'urls': ['stun:stun.l.google.com:19302']},
-      ],
-      isController: true,
-    ).then((_) {
-      _screenCapture = ScreenCaptureManager();
-      _screenCapture!
-          .startCapture(fps: 30, maxWidth: 1920, maxHeight: 1080)
-          .then((stream) {
-        _peer.localStream = stream;
-        for (final track in stream.getTracks()) {
-          if (track.kind == 'video') {
-            _peer.addTrack(stream).then((sender) {
-              print('Controller: video track added');
-            });
-          }
-        }
-      }).catchError((e) {
-        print('Controller: screen capture failed — ${e.toString().substring(0, 100)}');
-      });
+    _screenCapture = ScreenCaptureManager();
+    _screenCapture!
+        .startCapture(fps: 30, maxWidth: 1920, maxHeight: 1080)
+        .then((stream) async {
+      _peer.localStream = stream;
+      onLocalStreamUpdated?.call(stream);
+      // Add every track (the screen video) to the PeerConnection BEFORE
+      // any offer is created, otherwise the SDP would have no media.
+      await _peer.addTracks(stream);
+      print('Controller: ${stream.getTracks().length} local track(s) added');
+      _screenCaptureReady = true;
+      _maybeCreateOffer();
+    }).catchError((e) {
+      print('Controller: screen capture failed — ${e.toString().substring(0, 100)}');
+      onCaptureError?.call(
+          'Screen capture failed: grant Screen Recording permission (macOS) or run a build signed with that entitlement.');
     });
   }
 
   // ========== Viewer Side ==========
 
   void _setupViewer() {
-    _peer.initialize(
-      iceServers: [
-        {'urls': ['stun:stun.l.google.com:19302']},
-      ],
-      isController: false,
-    );
     _inputHandler = InputEventHandler((event) {
       if (event is MouseEvent) {
         _signal.sendMouseEvent(
@@ -178,6 +204,9 @@ class ConnectionManager {
     switch (msg.type) {
       case SignalType.roomJoined:
         await _onRoomJoined(msg);
+        break;
+      case SignalType.peerJoined:
+        await _onPeerJoined(msg);
         break;
       case SignalType.offer:
         await _onOffer(msg);
@@ -200,27 +229,84 @@ class ConnectionManager {
   }
 
   Future<void> _onRoomJoined(SignalMessage msg) async {
-    if (room.role == 'controller') {
-      try {
-        final offer = await _peer.createOffer();
-        await _signal.sendOffer(offer, room.id);
-        print('Controller: sent OFFER');
-      } catch (e) {
-        print('Controller: createOffer failed: $e');
+    if (room.role != 'controller') return;
+
+    // Learn about any peers (viewers) already in the room.
+    final payload = msg.payload as Map<String, dynamic>?;
+    final peers = (payload?['peers'] as List?)?.cast<Map<String, dynamic>>() ?? [];
+    for (final p in peers) {
+      if (p['role'] == 'viewer') {
+        _remoteUserId = p['userId'] as String?;
+        break;
       }
+    }
+
+    if (_remoteUserId != null) {
+      _maybeCreateOffer();
+    } else {
+      print('Controller: joined, waiting for a viewer to join...');
+    }
+  }
+
+  /// Called when another peer joins the room (relayed by the server).
+  /// The controller uses this to (re)negotiate with a newly arrived viewer.
+  Future<void> _onPeerJoined(SignalMessage msg) async {
+    if (room.role != 'controller') return;
+    final payload = msg.payload as Map<String, dynamic>?;
+    if (payload == null) return;
+
+    final newUserId = payload['userId'] as String?;
+    final newRole = payload['role'] as String?;
+    if (newRole == 'viewer' && newUserId != null) {
+      _remoteUserId = newUserId;
+      print('Controller: viewer "$newUserId" joined');
+      _maybeCreateOffer();
+    }
+  }
+
+  /// Create and send an offer only when both preconditions are met:
+  /// the local screen capture is ready AND we know the viewer's id.
+  void _maybeCreateOffer() {
+    if (room.role != 'controller') return;
+    if (!_screenCaptureReady) {
+      print('Controller: delay offer — screen capture not ready yet');
+      return;
+    }
+    if (_remoteUserId == null) {
+      print('Controller: delay offer — no viewer known yet');
+      return;
+    }
+    _createAndSendOffer();
+  }
+
+  /// Build a local SDP offer and send it to the known viewer peer.
+  Future<void> _createAndSendOffer() async {
+    try {
+      final offer = await _peer.createOffer();
+      final desc = offer.toMap();
+      print('Controller: creating OFFER (type=${desc['type']}, '
+          'sdp length=${(desc['sdp'] as String?)?.length ?? 0}) to ${_remoteUserId ?? 'unknown'}');
+      await _signal.sendOffer(offer, room.id, _remoteUserId);
+      print('Controller: sent OFFER to ${_remoteUserId ?? 'unknown'}');
+    } catch (e) {
+      print('Controller: createOffer failed: $e');
     }
   }
 
   Future<void> _onOffer(SignalMessage msg) async {
     final payload = msg.payload as Map<String, dynamic>?;
     if (payload == null || room.role != 'viewer') return;
-    final sdpJSON = payload['sdp'];
+    final sdpMap = payload['sdp'] as Map<String, dynamic>;
     _remoteUserId = msg.from;
+    print('Viewer: received OFFER from ${msg.from} '
+        '(sdp length=${(sdpMap['sdp'] as String?)?.length ?? 0})');
     try {
-      await _peer.setRemoteDescriptionWithType('offer', jsonEncode(sdpJSON));
+      await _peer.setRemoteDescriptionWithType(
+          sdpMap['type'] as String, sdpMap['sdp'] as String);
       final answer = await _peer.createAnswer();
-      await _signal.sendAnswer(answer, room.id);
-      print('Viewer: sent ANSWER');
+      print('Viewer: created ANSWER, sending to ${_remoteUserId ?? 'unknown'}');
+      await _signal.sendAnswer(answer, room.id, _remoteUserId);
+      print('Viewer: sent ANSWER to ${_remoteUserId ?? 'unknown'}');
     } catch (e) {
       print('Viewer: createAnswer failed: $e');
     }
@@ -229,9 +315,12 @@ class ConnectionManager {
   Future<void> _onAnswer(SignalMessage msg) async {
     final payload = msg.payload as Map<String, dynamic>?;
     if (payload == null || room.role != 'controller') return;
+    print('Controller: received ANSWER from ${msg.from}');
     try {
+      final sdpMap = payload['sdp'] as Map<String, dynamic>;
       await _peer.setRemoteDescriptionWithType(
-          'answer', jsonEncode(payload['sdp']));
+          sdpMap['type'] as String, sdpMap['sdp'] as String);
+      print('Controller: remote description set from ANSWER');
     } catch (e) {
       print('Controller: setRemoteDescription failed: $e');
     }
@@ -262,6 +351,7 @@ class ConnectionManager {
   void _onRemoteStreamReceived(MediaStream stream) {
     _remoteStream = stream;
     print('Remote video stream received: ${stream.id}');
+    onRemoteStreamUpdated?.call(stream);
   }
 
   // ========== ICE Candidate Forwarding (local → remote) ==========

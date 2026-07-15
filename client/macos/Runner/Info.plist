@@ -28,9 +28,7 @@
 	<string>MainMenu</string>
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>
-	<key>NSCameraUsageDescription</key>
-	<string>This app needs camera access to capture your screen for remote control sessions.</string>
-	<key>NSMicrophoneUsageDescription</key>
-	<string>This app needs microphone access for audio in remote sessions.</string>
+	<key>NSScreenCaptureUsageDescription</key>
+	<string>This app needs screen recording access to share your screen for remote control sessions.</string>
 </dict>
 </plist>

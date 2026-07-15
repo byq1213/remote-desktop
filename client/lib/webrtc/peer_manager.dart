@@ -41,10 +41,13 @@ class PeerManager {
 
     // Handle remote tracks
     _pc!.onTrack = (RTCTrackEvent event) {
+      print('PeerManager: onTrack event, streams=${event.streams.length}, '
+          'tracks=${event.track != null ? 1 : 0}');
       if (event.streams.isNotEmpty) {
         for (final stream in event.streams) {
           for (final track in stream.getTracks()) {
             if (track.kind == 'video') {
+              print('PeerManager: remote VIDEO track received (${stream.id})');
               for (final listener in List.from(_onRemoteStreamListeners)) {
                 listener(stream);
               }
@@ -56,17 +59,18 @@ class PeerManager {
 
     // Handle ICE candidates — forward to external callback for server relay
     _pc!.onIceCandidate = (RTCIceCandidate candidate) {
-      print('ICE candidate: ${candidate.sdpMid}');
+      print('PeerManager: local ICE candidate (mid=${candidate.sdpMid}, '
+          'foundation=${candidate.candidate?.substring(0, 20)})');
       _externalIceCallback?.call(candidate);
     };
 
     // Handle connection state changes
     _pc!.onIceConnectionState = (state) {
-      print('ICE connection state: $state');
+      print('PeerManager: ICE connection state = $state');
     };
 
     _pc!.onConnectionState = (state) {
-      print('PeerConnection state: $state');
+      print('PeerManager: PeerConnection state = $state');
     };
 
     print('PeerManager initialized (controller: $isController)');
@@ -75,15 +79,39 @@ class PeerManager {
   /// Create and set local SDP offer.
   Future<RTCSessionDescription> createOffer() async {
     final offer = await _pc!.createOffer();
-    await _pc!.setLocalDescription(offer);
-    return offer;
+    final preferred =
+        _preferCodec(offer.sdp ?? '', 'VP8') ?? offer.sdp ?? '';
+    final desc = RTCSessionDescription(preferred, offer.type);
+    await _pc!.setLocalDescription(desc);
+    return desc;
   }
 
   /// Create and set local SDP answer.
   Future<RTCSessionDescription> createAnswer() async {
     final answer = await _pc!.createAnswer();
-    await _pc!.setLocalDescription(answer);
-    return answer;
+    final preferred =
+        _preferCodec(answer.sdp ?? '', 'VP8') ?? answer.sdp ?? '';
+    final desc = RTCSessionDescription(preferred, answer.type);
+    await _pc!.setLocalDescription(desc);
+    return desc;
+  }
+
+  /// Reorder the m=video payload types so the given codec (e.g. VP8) is
+  /// first, steering macOS WebRTC away from the flaky H.264 VideoToolbox
+  /// screencast path. Returns null if the codec isn't present.
+  String? _preferCodec(String sdp, String codec) {
+    final videoMatch = RegExp(r'm=video.*').firstMatch(sdp);
+    if (videoMatch == null) return null;
+    final codecMatch =
+        RegExp(r'a=rtpmap:(\d+) $codec/90000').firstMatch(sdp);
+    if (codecMatch == null) return null;
+    final pt = codecMatch.group(1)!;
+    final mLine = videoMatch.group(0)!;
+    final parts = mLine.split(' ');
+    if (parts.length < 4) return null;
+    final head = parts.take(3).join(' ');
+    final rest = parts.skip(3).where((p) => p != pt).join(' ');
+    return sdp.replaceFirst(mLine, '$head $pt $rest');
   }
 
   /// Set remote description (offer or answer received from peer).
@@ -101,12 +129,16 @@ class PeerManager {
     await _pc!.setRemoteDescription(RTCSessionDescription(sdp, type));
   }
 
-  /// Add a local media track (used by controller for screen capture).
-  Future<RTCRtpSender> addTrack(MediaStream stream) async {
-    final track = stream.getTracks().first;
-    final sender = await _pc!.addTrack(track, stream);
-    _senders[track.id!] = sender;
-    return sender;
+  /// Add all local media tracks (used by controller for screen capture).
+  Future<List<RTCRtpSender>> addTracks(MediaStream stream) async {
+    final senders = <RTCRtpSender>[];
+    for (final track in stream.getTracks()) {
+      print('PeerManager: adding local ${track.kind} track');
+      final sender = await _pc!.addTrack(track, stream);
+      _senders[track.id!] = sender;
+      senders.add(sender);
+    }
+    return senders;
   }
 
   /// Get local stream (for controller's screen capture).

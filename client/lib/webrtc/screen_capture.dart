@@ -1,14 +1,17 @@
 /// Screen capture abstraction for Flutter desktop.
 ///
-/// IMPORTANT: On Flutter Desktop (macOS/Windows/Linux), the browser API
-/// `navigator.mediaDevices.getDisplayMedia` may NOT be available through
-/// flutter-webrtc. Desktop screen capture requires platform-channel plugins
-/// (e.g. screen_retriever + native AVFoundation/DXGI code).
+/// On Flutter Desktop (macOS/Windows/Linux), screen sharing uses
+/// `navigator.mediaDevices.getDisplayMedia`, which presents the OS-native
+/// screen/window picker and requests the *screen-recording* permission —
+/// NOT the camera. This keeps the "share screen" flow semantically correct
+/// and avoids prompting for camera access.
 ///
-/// For MVP testing, a fallback camera capture mode is provided to verify
-/// the WebRTC signaling and video transport pipeline works end-to-end.
-/// The video transport is identical regardless of source — once the
-/// signaling works, swapping camera for screen capture is a source change.
+/// NOTE: On macOS, `getDisplayMedia` for desktop requires the
+/// `com.apple.security.screen-recording` entitlement to be signed (a paid
+/// Apple Developer account is needed for that restricted entitlement). If the
+/// capability is unavailable, the call throws and the caller surfaces a clear
+/// error instead of silently falling back to the camera.
+
 library;
 
 import 'package:flutter_webrtc/flutter_webrtc.dart';
@@ -20,7 +23,9 @@ class ScreenCaptureManager {
   bool get isCapturing => _isCapturing;
 
   /// Start screen capture (desktop mode).
-  /// Falls back to camera if getDisplayMedia is unavailable on desktop.
+  ///
+  /// Uses `getDisplayMedia` so the OS picker appears and only the
+  /// screen-recording permission is requested.
   Future<MediaStream> startCapture({
     int maxWidth = 1920,
     int maxHeight = 1080,
@@ -29,19 +34,44 @@ class ScreenCaptureManager {
     if (_isCapturing) {
       throw StateError('Screen capture already in progress');
     }
-    _screenStream = await startCameraCapture();
+    _screenStream = await _startDisplayCapture(
+      maxWidth: maxWidth,
+      maxHeight: maxHeight,
+      fps: fps,
+    );
     _isCapturing = true;
     return _screenStream!;
   }
 
-  /// Camera capture — fallback for testing WebRTC video pipeline.
-  Future<MediaStream> startCameraCapture() async {
+  /// Capture the display/screen via `getDisplayMedia`.
+  ///
+  /// This triggers the platform screen picker and the screen-recording
+  /// permission prompt — never the camera.
+  Future<MediaStream> _startDisplayCapture({
+    int maxWidth = 1920,
+    int maxHeight = 1080,
+    int fps = 30,
+  }) async {
+    // Cap the *longer* side only, so the source's aspect ratio is preserved
+    // for both landscape and portrait (e.g. vertical external) displays.
+    // Capping width AND height independently would squash a portrait source
+    // into a 16:9 box and distort it.
+    final cap = maxWidth > maxHeight ? maxWidth : maxHeight;
     final constraints = {
       'audio': false,
-      'video': {'facingMode': 'user', 'width': 640, 'height': 480},
+      'video': {
+        'frameRate': fps,
+        'width': {'max': cap},
+        'height': {'max': cap},
+      },
     };
-    _screenStream = await navigator.mediaDevices.getUserMedia(constraints);
-    print('ScreenCapture: using camera fallback for video source');
+    try {
+      _screenStream = await navigator.mediaDevices.getDisplayMedia(constraints);
+    } catch (e) {
+      print('ScreenCapture: getDisplayMedia failed: $e');
+      rethrow;
+    }
+    print('ScreenCapture: screen capture started via getDisplayMedia');
     return _screenStream!;
   }
 

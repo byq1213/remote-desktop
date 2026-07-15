@@ -45,7 +45,6 @@ class _ControlScreenState extends State<ControlScreen> {
     super.initState();
     _remoteRenderer = RTCVideoRenderer();
     _localRenderer = RTCVideoRenderer();
-    _initRenderers();
 
     _connectionManager = ConnectionManager(
       room: Room(id: widget.roomId, role: widget.role),
@@ -53,12 +52,16 @@ class _ControlScreenState extends State<ControlScreen> {
       token: widget.token,
     );
     _connectionManager.addStateListener(_onConnectionStateChange);
+    _connectionManager.onRemoteStreamUpdated = _wireRemoteVideo;
+    _connectionManager.onLocalStreamUpdated = _wireLocalVideo;
+    _connectionManager.onCaptureError = (msg) => setState(() => _statusMessage = msg);
     _connect();
   }
 
   Future<void> _initRenderers() async {
     await _remoteRenderer.initialize();
     await _localRenderer.initialize();
+    print('Renderers initialized: remote.textureId=${_remoteRenderer.textureId}, local.textureId=${_localRenderer.textureId}');
   }
 
   @override
@@ -98,11 +101,69 @@ class _ControlScreenState extends State<ControlScreen> {
     });
   }
 
-  void _wireRemoteVideo() {
-    final stream = _connectionManager.remoteStream;
-    if (stream != null && _remoteRenderer.srcObject != stream) {
-      _remoteRenderer.srcObject = stream;
-      print('Viewer: remote video renderer bound');
+  void _wireRemoteVideo([MediaStream? stream]) {
+    if (!mounted) return;
+    final s = stream ?? _connectionManager.remoteStream;
+    if (s != null && _remoteRenderer.srcObject != s) {
+      final tracks = s.getTracks();
+      print('Viewer: wiring remote video — stream=${s.id}, '
+          'tracks=${tracks.length}, '
+          'rendererInitialized=${_remoteRenderer.textureId != null}, '
+          'videoSize=${_remoteRenderer.videoWidth}x${_remoteRenderer.videoHeight}');
+      for (final t in tracks) {
+        print('  track: kind=${t.kind}, enabled=${t.enabled}, muted=${t.muted}');
+      }
+      if (_remoteRenderer.textureId == null) {
+        print('Viewer: WARNING — renderer not initialized, deferring');
+        Future.delayed(const Duration(milliseconds: 200), () => _wireRemoteVideo(s));
+        return;
+      }
+      _remoteRenderer.srcObject = s;
+      // DEBUG: fires when the first decoded frame actually reaches the renderer.
+      _remoteRenderer.onFirstFrameRendered = () {
+        print('Viewer: FIRST FRAME RENDERED — '
+            'videoSize=${_remoteRenderer.videoWidth}x${_remoteRenderer.videoHeight}');
+        if (mounted) setState(() {}); // re-layout to the real aspect ratio
+      };
+      // DEBUG: track mute tells us if the remote stopped sending media.
+      for (final t in tracks) {
+        t.onMute = () => print('Viewer: track MUTED — kind=${t.kind}');
+      }
+      Future.delayed(const Duration(milliseconds: 500), () {
+        print('Viewer: after bind — videoSize='
+            '${_remoteRenderer.videoWidth}x${_remoteRenderer.videoHeight}, '
+            'trackCount=${tracks.length}, '
+            'anyMuted=${tracks.any((t) => t.muted ?? false)}');
+      });
+      setState(() {});
+    }
+  }
+
+  void _wireLocalVideo([MediaStream? stream]) {
+    if (!mounted) return;
+    final s = stream ?? _connectionManager.localStream;
+    if (s != null && _localRenderer.srcObject != s) {
+      final tracks = s.getTracks();
+      print('Controller: wiring local video — stream=${s.id}, '
+          'tracks=${tracks.length}, '
+          'rendererInitialized=${_localRenderer.textureId != null}, '
+          'videoSize=${_localRenderer.videoWidth}x${_localRenderer.videoHeight}');
+      for (final t in tracks) {
+        print('  track: kind=${t.kind}, enabled=${t.enabled}, muted=${t.muted}');
+      }
+      if (_localRenderer.textureId == null) {
+        print('Controller: WARNING — renderer not initialized, deferring');
+        Future.delayed(const Duration(milliseconds: 200), () => _wireLocalVideo(s));
+        return;
+      }
+      _localRenderer.srcObject = s;
+      // DEBUG: confirms the controller's own capture is producing frames.
+      _localRenderer.onFirstFrameRendered = () {
+        print('Controller: FIRST FRAME RENDERED (local preview) — '
+            'videoSize=${_localRenderer.videoWidth}x${_localRenderer.videoHeight}');
+        if (mounted) setState(() {}); // re-layout to the real aspect ratio
+      };
+      setState(() {});
     }
   }
 
@@ -111,6 +172,10 @@ class _ControlScreenState extends State<ControlScreen> {
       _isConnecting = true;
       _errorMsg = null;
     });
+
+    // Ensure renderers are initialized BEFORE connecting, so that
+    // incoming video streams can be bound immediately.
+    await _initRenderers();
 
     final success = await _connectionManager.connect(widget.userId);
     if (mounted) {
@@ -125,8 +190,9 @@ class _ControlScreenState extends State<ControlScreen> {
 
   void _startStatsMonitoring() {
     _statsTimer = Timer.periodic(const Duration(seconds: 2), (_) {
-      // Try to wire remote video if it arrived asynchronously
+      // Try to wire remote/local video if it arrived asynchronously
       _wireRemoteVideo();
+      _wireLocalVideo();
       setState(() {
         _fps = 30;
         _latency = 50;
@@ -137,6 +203,11 @@ class _ControlScreenState extends State<ControlScreen> {
   void _disconnect() {
     _connectionManager.disconnect();
     if (mounted) Navigator.of(context).pop();
+  }
+
+  /// Stop sharing (controller) and return to the connect screen.
+  void _stopSharing() {
+    _disconnect();
   }
 
   @override
@@ -205,28 +276,64 @@ class _ControlScreenState extends State<ControlScreen> {
       const SizedBox(height: 8),
       Text('Others can view your screen via ${widget.roomId}',
         style: const TextStyle(fontSize: 13, color: Colors.white54)),
-      const SizedBox(height: 32),
-      OutlinedButton.icon(
-        onPressed: null,
+      const SizedBox(height: 16),
+      // Local preview so the controller can confirm the screen is being captured.
+      // Sized to the captured display's aspect ratio (handles portrait too).
+      _fitVideoBox(_localRenderer, 640, 360),
+      const SizedBox(height: 24),
+      ElevatedButton.icon(
+        onPressed: _stopSharing,
         icon: const Icon(Icons.stop_circle_outlined, size: 16),
         label: const Text('Stop Sharing'),
-        style: OutlinedButton.styleFrom(foregroundColor: Colors.red[300]),
+        style: ElevatedButton.styleFrom(foregroundColor: Colors.red[300]),
       ),
     ]));
   }
 
   Widget _buildViewerView() {
     return Center(child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
-      ClipRRect(borderRadius: BorderRadius.circular(12), child: Container(
-        width: 640, height: 360, color: Colors.grey[850],
-        child: RTCVideoView(_remoteRenderer,
-          objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitContain,
-          mirror: false)),
-      ),
+      // Sized to the remote display's aspect ratio so portrait sources show
+      // tall instead of being squished into a 16:9 box.
+      _fitVideoBox(_remoteRenderer, 640, 360),
       const SizedBox(height: 16),
-      Text('Watching: ${widget.userId}',
-        style: const TextStyle(fontSize: 13, color: Colors.white54)),
+      Text('Watching: ${widget.userId}  |  '
+          'renderer: ${_remoteRenderer.videoWidth}x${_remoteRenderer.videoHeight}  |  '
+          'srcObject: ${_remoteRenderer.srcObject?.id ?? "null"}',
+        style: const TextStyle(fontSize: 11, color: Colors.white38)),
     ]));
+  }
+
+  /// Render a video surface sized to its real aspect ratio, fitting inside a
+  /// max box. This keeps portrait/landscape displays undistorted. The inner
+  /// RTCVideoView uses Fill because the surrounding box already matches the
+  /// video's aspect ratio.
+  Widget _fitVideoBox(RTCVideoRenderer renderer, double maxW, double maxH) {
+    final vw = renderer.videoWidth;
+    final vh = renderer.videoHeight;
+    final hasSize = vw > 0 && vh > 0;
+    double w = maxW, h = maxH;
+    if (hasSize) {
+      final ar = vw / vh;
+      w = maxW;
+      h = w / ar;
+      if (h > maxH) {
+        h = maxH;
+        w = h * ar;
+      }
+    }
+    return ClipRRect(borderRadius: BorderRadius.circular(12), child: Container(
+      width: w,
+      height: h,
+      color: hasSize ? Colors.blue[900] : Colors.grey[850],
+      child: Stack(alignment: Alignment.center, children: [
+        RTCVideoView(renderer,
+          objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitFill,
+          mirror: false),
+        if (!hasSize)
+          const Text('Waiting for video frames...',
+            style: TextStyle(color: Colors.yellowAccent, fontSize: 14)),
+      ]),
+    ));
   }
 
   Widget _buildToolbar(bool isController) {
