@@ -1,0 +1,49 @@
+# ===================== OS / Editor =====================
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+*.swp
+*.swo
+*~
+
+# JetBrains / IntelliJ
+.idea/
+*.iml
+
+# VS Code（按需取消注释以忽略配置）
+# .vscode/
+
+# ===================== Flutter / Dart / macOS Client =====================
+client/.dart_tool/
+client/.flutter-plugins
+client/.flutter-plugins-dependencies
+client/.pub-cache/
+client/.pub/
+client/build/
+client/coverage/
+client/remote_desktop.iml
+
+# macOS (Xcode) build artifacts
+client/macos/Pods/
+client/macos/Flutter/ephemeral/
+client/macos/**/xcuserdata/
+client/macos/**/dgph
+client/ios/Flutter/.last_build_id
+
+# ===================== Node.js / Server =====================
+server/node_modules/
+server/dist/
+server/build/
+server/coverage/
+server/.env
+server/*.log
+server/npm-debug.log*
+
+# ===================== Doc & Log =====================
+
+docs/*
+!docs/SETUP.md
+!docs/ARCHITECTURE.md
+!docs/TRADEOFFS.md
+logs/
