@@ -1,23 +1,23 @@
 /**
  * Remote Desktop Server — Entry Point
  *
- * Express HTTP for auth endpoints + WebSocket for signaling
+ * Responsibilities:
+ *   - Express HTTP for the auth endpoint (/api/auth/join)
+ *   - WebSocket for signaling relay (delegated to signal-server.js)
+ *
+ * Media is P2P WebRTC — this server only relays SDP/ICE and control messages.
+ * There is deliberately no SFU; a remote-control session is 1 controller →
+ * 1 viewer, so relaying signaling is all the server needs to do.
  */
 
 import express from 'express';
 import { createServer } from 'http';
-import jwt from 'jsonwebtoken';
 import { config } from './utils/config.js';
 import { logger } from './utils/logger.js';
-import { mediasoupHandler } from './mediasoup-handler.js';
 import { setupSignalServer } from './signal-server.js';
+import { generateToken } from './auth.js';
 
 async function main() {
-  // Initialize mediasoup worker
-  await mediasoupHandler.init();
-  logger.info('Mediasoup worker initialized');
-
-  // Express app
   const app = express();
   app.use(express.json());
 
@@ -26,49 +26,30 @@ async function main() {
     res.json({ status: 'ok', uptime: process.uptime() });
   });
 
-  // Auth endpoint — clients call this to get a room-scoped JWT
+  // Auth endpoint — clients call this to get a room-scoped JWT.
   app.post('/api/auth/join', (req, res) => {
-    const { userId, roomId, role } = req.body;
+    const { userId, roomId, role } = req.body ?? {};
 
     if (!userId || !roomId || !role) {
       return res.status(400).json({ error: 'Missing userId, roomId, or role' });
     }
-
     if (!['controller', 'viewer'].includes(role)) {
       return res.status(400).json({ error: 'Invalid role' });
     }
 
-    const expiresIn = role === 'controller' ? 3600 : 900; // 1h / 15min
-    const token = jwt.sign(
-      { userId, roomId, role },
-      config.jwtSecret,
-      { expiresIn }
-    );
+    // Controllers hold a longer-lived token (they tend to stay connected);
+    // viewers get a shorter one since they join for a single session.
+    const expiresIn = role === 'controller' ? 3600 : 900;
+    const token = generateToken({ userId, roomId, role, expiresIn });
 
     logger.info({ userId, roomId, role }, 'Token generated');
     res.json({ token });
   });
 
-  // Get router capabilities (for new peers joining)
-  app.get('/api/rooms/:roomId/info', async (req, res) => {
-    const { roomId } = req.params;
-    try {
-      const router = await mediasoupHandler.getOrCreateRouter(roomId);
-      res.json({
-        routerRtpCapabilities: router.rtpCapabilities,
-      });
-    } catch (err) {
-      res.status(500).json({ error: err.message });
-    }
-  });
-
-  // Create server
+  // WebSocket signal server (attached to the same HTTP server).
   const httpServer = createServer(app);
-
-  // Setup WebSocket signal server
   setupSignalServer(httpServer);
 
-  // Start listening
   httpServer.listen(config.port, () => {
     logger.info({ port: config.port }, 'Server started');
   });

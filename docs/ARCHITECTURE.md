@@ -6,7 +6,7 @@ A remote desktop control system built with:
 
 - **Client (Controller)**: Flutter Desktop — captures local screen, sends mouse/keyboard events
 - **Viewer**: Flutter Desktop or Browser — receives and displays remote screen, sends control commands
-- **Server**: Node.js + mediasoup — handles WebRTC signaling, media routing, and control relay
+- **Server**: Node.js — relays WebRTC signaling and control commands; it does **not** route media (no SFU)
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
@@ -18,27 +18,26 @@ A remote desktop control system built with:
 │  └─────────────┘  └──────────────┘  └──────────┬──────────┘  │
 │                                                 │ RtpSender   │
 └─────────────────────────────────────────────────┼─────────────┘
-                                                  │ WebRTC Media
-                                                  │ WebSocket Signal
-                                                  ▼
-┌──────────────────────────────────────────────────────────────┐
-│              Server (Node.js + mediasoup)                     │
-│  ┌──────────────────────┐  ┌─────────────────────────────┐   │
-│  │  Signal Router       │  │  Media Router (mediasoup)   │   │
-│  │  - WS Endpoint       │  │  - Producer (Controller)    │   │
-│  │  - Auth/JWT          │  │  - Consumers (Viewers)      │   │
-│  │  - Control Relay     │  │  - Scalable Forwarding     │   │
-│  │  - Room Management   │  │  - RTX/NACK Handling        │   │
-│  └──────────────────────┘  └─────────────────────────────┘   │
-└──────────────────────────────────────────────────────────────┘
+                                                  │ WebRTC Media (P2P)
                                                   │
-                                                  │ WebRTC Media
-                                                  │ WebSocket Signal
-                                                  ▼
+                                  ┌───────────────┴───────────────┐
+                                  ▼                               │
+┌─────────────────────────────────────────────────┐             │
+│  Server (Node.js — signaling relay only)         │             │
+│  - WS Endpoint (no path pin)                     │             │
+│  - Auth/JWT (verifyToken)                        │             │
+│  - Signaling relay (OFFER/ANSWER/ICE)            │             │
+│  - Control relay (MOUSE_EVENT/KEY_EVENT)         │             │
+│  - Room = 1 controller + 1 viewer                │             │
+└─────────────────────────────────────────────────┘             │
+                                  ▲                               │
+                                  │ WebSocket Signal / Control   │
+                                  └───────────────┬───────────────┘
+                                                  │
 ┌──────────────────────────────────────────────────────────────┐
 │                   Viewer Client                              │
 │  ┌─────────────────────────────────────────────────────┐     │
-│  │  WebRTC PeerConnection ──► Decoder ──► Canvas/Image  │     │
+│  │  WebRTC PeerConnection ──► Decoder ──► RTCVideoView  │     │
 │  │  Mouse/Keyboard Events ──► Signal WS ──► Server      │     │
 │  └─────────────────────────────────────────────────────┘     │
 └──────────────────────────────────────────────────────────────┘
@@ -55,9 +54,9 @@ Controller Screen
     │
     ├─ [Step 2] Encode to VP8/VP9 (GStreamer + ffmpeg)
     │
-    ├─ [Step 3] RtpSender → mediasoup Producer
+    ├─ [Step 3] RtpSender carries the encoded frame over the P2P PeerConnection
     │
-    ├─ [Step 4] mediasoup forwards RTP packets to all Consumers
+    ├─ [Step 4] (No media server) — RTP flows directly controller → viewer
     │
     ├─ [Step 5] Viewer PeerConnection receives RTP
     │
@@ -84,28 +83,18 @@ Viewer Mouse Click
 
 ### 3.1 Server Modules
 
-#### `signal-server.js` — WebSocket Signaling Gateway
-- **Responsibility**: Authenticate peers, route signaling messages, manage session lifecycle
-- **Protocols**:
-  - `JOIN_ROOM` — peer joins a room, gets room info
-  - `OFFER` — controller offers SDP, forwarded to viewers
-  - `ANSWER` — viewer answers SDP, forwarded to controller
+#### `signal-server.js` — WebSocket Signaling / Control Relay
+- **Responsibility**: Authenticate peers (JWT), relay signaling messages, relay control commands, manage room lifecycle. **No media handling.**
+- **Protocols** (see `client/lib/signal/protocol.dart` for the canonical constants):
+  - `JOIN_ROOM` — peer joins a room, gets `ROOM_JOINED` (with existing peers)
+  - `OFFER` — controller offers SDP, relayed to the viewer (`to`)
+  - `ANSWER` — viewer answers SDP, relayed to the controller (`to`)
   - `ICE_CANDIDATE` — ICE candidate relay
-  - `CONTROL_CMD` — mouse/keyboard events relay
-  - `LEAVE_ROOM` — cleanup resources
-- **Security**: JWT verification middleware, rate limiting, per-room auth token
-
-#### `mediasoup-handler.js` — Media Routing
-- **Responsibility**: Manage mediasoup rooms, producers, consumers
-- **Flow**:
-  ```
-  Controller JOIN → Create Producer → Router.produce()
-  Viewer JOIN → Create Consumer → Router.consume()
-  ```
-- **Optimization**:
-  - Simulcast for adaptive quality (low bandwidth → low bitrate layer)
-  - RTX retransmission for lost keyframes
-  - NACK for lost packets
+  - `MOUSE_EVENT` / `KEY_EVENT` — control commands, relayed to the controller
+  - `PEER_JOINED` / `PEER_LEFT` — room membership notifications
+  - `AUTH_ERROR` — auth/room-mismatch errors
+  - `LEAVE_ROOM` — cleanup
+- **Security**: JWT `verifyToken` on join, per-room token scope, role-checked control relay (only viewers may send control)
 
 #### `auth.js` — Authentication
 - **Strategy**: JWT with room-specific audience
@@ -123,7 +112,8 @@ Viewer Mouse Click
 
 #### `lib/webrtc/peer_manager.dart` — WebRTC Lifecycle
 - Manages `RTCPeerConnection` creation, track management, ICE handling
-- Reconnection logic: if connection drops for >5s, attempt reconnect up to 3 times
+- Real stats via `getStats()` (FPS, RTT, packets lost) for the HUD
+- Reconnection: driven by `SignalClient` exponential backoff (max 6 attempts)
 
 ```dart
 class PeerManager {
@@ -162,26 +152,22 @@ class ScreenCapture {
 }
 ```
 
-#### `lib/input/event_handler.dart` — Control Event Handler
-- Captures mouse movement, clicks, keyboard input
-- Debounces mouse movement at 60Hz (16ms interval)
-- Serializes to compact JSON to minimize bandwidth
+#### `lib/input/input_controller.dart` — Remote Input Replay (controller side)
+- Replays incoming `MOUSE_EVENT` / `KEY_EVENT` onto the local machine via `MethodChannel('remote_desktop/input')` → macOS `CGEvent`.
+- Coordinate mapping: `[0..1]` payload × `localScreenSize` → pixel coords.
+- Viewer-side capture is done directly in `control_screen.dart` (`Listener` for pointer, `Focus.onKeyEvent` for keyboard) and forwarded through `ConnectionManager.sendInputMouse` / `sendInputKey`.
 
 ```dart
-class EventHandler {
-  static const _mouseIntervalMs = 16; // 60Hz
-  
-  void init() {
-    _mouseStream = PlatformMouseStream().subscribe(debounce: _mouseIntervalMs);
-    _keyStream = PlatformKeyStream().subscribe();
-    
-    _mouseStream.listen((event) {
-      _signalServer.send('MOUSE_EVENT', {
-        'type': event.type, // 'move' | 'down' | 'up'
-        'x': event.x,
-        'y': event.y,
-        'button': event.button,
-      });
+class InputController {
+  final bool isController;
+  Size localScreenSize;
+
+  void applyRemoteMouse(String action, double nx, double ny, int button, double delta) {
+    if (!isController) return;
+    final px = nx * localScreenSize.width;
+    final py = ny * localScreenSize.height;
+    _inputChannel.invokeMethod('mouse', {
+      'action': action, 'x': px, 'y': py, 'button': button, 'delta': delta,
     });
   }
 }
@@ -197,28 +183,31 @@ class EventHandler {
 ### 4.1 WebRTC Negotiation Sequence
 
 ```
-Controller ────JOIN ROOM────► Server ◄────JOIN ROOM──── Viewer
+Controller ────JOIN_ROOM────► Server ◄────JOIN_ROOM──── Viewer
       │                          │                        │
-      │──── CREATE PRODUCER ──► │                        │
+      │  (controller starts screen capture)              │
       │                          │                        │
-      │  ────OFFER (SDP)────► Consumer ──ANSWER────► Server
+      │  ────OFFER (SDP)────────────────────────────────►│  (relayed by Server, to=viewer)
+      │  ◄──ANSWER (SDP)─────────────────────────────────│
       │                          │                        │
-      │◄───ICE CANDIDATES────────│◄───ICE CANDIDATES─────│
+      │◄─ICE CANDIDATES──────────┼────────ICE CANDIDATES─►│
       │                          │                        │
-      │◄══════ MEDIA FLOW ══════│                        │
+      │════ MEDIA FLOW (WebRTC P2P, direct) ══════════════│
       │                          │                        │
-      │─── MOUSE EVENT ──────────┼──────── CONTROL CMD ──►
+      │◄─MOUSE/KEY EVENT (relayed by Server)──────────────│  Viewer → Controller
 ```
 
 ### 4.2 WebSocket Message Schema
 
 ```typescript
 interface SignalMessage {
-  type: 'JOIN_ROOM' | 'LEAVE_ROOM' | 'OFFER' | 'ANSWER' | 
+  type: 'JOIN_ROOM' | 'LEAVE_ROOM' | 'OFFER' | 'ANSWER' |
         'ICE_CANDIDATE' | 'MOUSE_EVENT' | 'KEY_EVENT' |
-        'AUTH_ERROR' | 'ROOM_FULL';
+        'ROOM_JOINED' | 'PEER_JOINED' | 'PEER_LEFT' | 'AUTH_ERROR';
   payload: Record<string, any>;
-  timestamp?: number;
+  roomId?: string;
+  from?: string;
+  to?: string;
 }
 
 // Example: Mouse Move Event
@@ -238,11 +227,11 @@ interface SignalMessage {
 
 | Scenario | Detection | Recovery |
 |----------|-----------|----------|
-| Network drop | ICE connection state changed to `disconnected` | Auto-reconnect after 3s, max 3 attempts |
+| Network drop | ICE connection state changed to `disconnected` | SignalClient auto-reconnects with exponential backoff (max 6 attempts) |
 | Screen capture crash | Native plugin throws | Restart capture with 1s backoff |
-| mediasoup room gone | Server sends `ROOM_FULL` or 404 | Show rejoin dialog |
-| High packet loss (>5%) | RTCP receiver report | Drop to lower quality simulcast layer |
-| JWT expired | Server sends 401 | Request refresh token from login screen |
+| Peer left / socket closed | Server relays `PEER_LEFT` or closes socket | UI shows disconnected; controller re-offers when viewer rejoins |
+| High packet loss (>5%) | RTCP receiver report (`getStats`) | Lower encoder scale via `resolution.dart` |
+| JWT expired / invalid | Server sends `AUTH_ERROR` | Show rejoin dialog / re-issue token |
 
 ## 6. Security Design
 
@@ -271,7 +260,7 @@ interface SignalMessage {
 | End-to-end latency (WAN) | < 500ms |同上, via TURN relay |
 | Frame rate | 30 fps @ 1080p | Controller-side FPS counter |
 | CPU usage (controller) | < 15% | macOS Activity Monitor |
-| Bandwidth (controller → server) | 2-4 Mbps | mediasoup transport stats |
+| Bandwidth (controller → viewer) | 2-4 Mbps | WebRTC transport stats (getStats) |
 | Control command latency | < 10ms | WebSocket round-trip time |
 
 ## 8. Tech Stack Summary
@@ -283,7 +272,7 @@ interface SignalMessage {
 | Screen Capture (macOS) | screen_capture plugin + AVFoundation | Built-in on macOS 10.15+ |
 | Screen Capture (Windows) | windows_desktop_capture + DXGI | DirectX GPU-accelerated capture |
 | Server Runtime | Node.js 20 LTS | Fits frontend background, quick iteration |
-| Media Server | mediasoup 3.x | SFU, simulcast, production-proven |
+| Media | WebRTC P2P (libwebrtc) | Direct 1:1 peer connection — no media server to deploy |
 | Signaling | ws (WebSocket) | Simple, reliable, built-in to Node ecosystem |
 | Auth | jsonwebtoken (JWT) | Stateless, scalable, easy to debug |
 | Config | dotenv + Zod schema | Type-safe config validation |

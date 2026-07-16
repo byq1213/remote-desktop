@@ -1,34 +1,9 @@
 import jwt from 'jsonwebtoken';
-import { config } from '../utils/config.js';
-import { logger } from '../utils/logger.js';
+import { config } from './utils/config.js';
+import { logger } from './utils/logger.js';
 
 /**
- * Validate and decode JWT token.
- * Expects token in Authorization header: "Bearer <token>"
- * Returns decoded payload or null.
- */
-export function authenticateToken(req) {
-  const authHeader = req.headers.authorization || req.query?.token;
-  if (!authHeader) {
-    logger.warn('Missing authorization header');
-    return null;
-  }
-
-  const token = authHeader.startsWith('Bearer ')
-    ? authHeader.slice(7)
-    : authHeader;
-
-  try {
-    const decoded = jwt.verify(token, config.jwtSecret);
-    return decoded;
-  } catch (err) {
-    logger.warn({ err: err.message }, 'JWT verification failed');
-    return null;
-  }
-}
-
-/**
- * Generate a room-scoped JWT token.
+ * Generate a room-scoped JWT.
  * @param {object} opts
  * @param {string} opts.userId
  * @param {string} opts.roomId
@@ -37,9 +12,22 @@ export function authenticateToken(req) {
  * @returns {string} JWT token
  */
 export function generateToken({ userId, roomId, role, expiresIn = 3600 }) {
-  return jwt.sign(
-    { userId, roomId, role },
-    config.jwtSecret,
-    { expiresIn }
-  );
+  return jwt.sign({ userId, roomId, role }, config.jwtSecret, { expiresIn });
+}
+
+/**
+ * Verify a JWT and return its decoded payload, or null if invalid/missing.
+ * Centralizes all JWT verification so the signal server and any future REST
+ * endpoints share one code path.
+ * @param {string|undefined} token
+ * @returns {object|null}
+ */
+export function verifyToken(token) {
+  if (!token) return null;
+  try {
+    return jwt.verify(token, config.jwtSecret);
+  } catch (err) {
+    logger.warn({ err: err.message }, 'JWT verification failed');
+    return null;
+  }
 }

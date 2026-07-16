@@ -1,53 +1,52 @@
 /**
- * WebSocket signal server for WebRTC signaling and control commands.
+ * WebSocket signal server for WebRTC signaling relay and control commands.
  *
- * Message protocol:
- *   { type: 'JOIN_ROOM', payload: { roomId, role, token } }
- *   { type: 'OFFER', payload: { sdp, roomId, from, to } }
- *   { type: 'ANSWER', payload: { sdp, roomId, from, to } }
- *   { type: 'ICE_CANDIDATE', payload: { candidate, roomId, from, to } }
- *   { type: 'MOUSE_EVENT', payload: { action, x, y, button }, roomId, from }
- *   { type: 'KEY_EVENT', payload: { key, code, action }, roomId, from }
+ * This server does NOT route media (no SFU). It only relays signaling
+ * (SDP / ICE) and control (mouse / keyboard) messages between the two peers
+ * in a room, and enforces JWT-scoped room membership.
+ *
+ * Protocol (shared constants live in the client at lib/signal/protocol.dart):
+ *   { type: 'JOIN_ROOM',     payload: { roomId, role, token } }
+ *   { type: 'OFFER',         payload: { sdp },               roomId, from, to }
+ *   { type: 'ANSWER',        payload: { sdp },               roomId, from, to }
+ *   { type: 'ICE_CANDIDATE', payload: { candidate, ... },    roomId, from, to }
+ *   { type: 'MOUSE_EVENT',   payload: { action, x, y, ... }, roomId, from }
+ *   { type: 'KEY_EVENT',     payload: { action, keyCode },   roomId, from }
  *   { type: 'LEAVE_ROOM' }
- *   { type: 'AUTH_ERROR', payload: { message } }
- *   { type: 'ROOM_FULL' }
+ *   { type: 'AUTH_ERROR',    payload: { message } }
+ *   { type: 'PEER_JOINED',   payload: { userId, role } }
+ *   { type: 'PEER_LEFT',     payload: { userId } }
+ *   { type: 'ROOM_JOINED',   payload: { roomId, role, peers } }
  */
 
-import WebSocket from 'ws';
 import { WebSocketServer } from 'ws';
-import url from 'url';
-import jwt from 'jsonwebtoken';
-import { config } from './utils/config.js';
+import { WebSocket } from 'ws';
 import { logger } from './utils/logger.js';
-import { mediasoupHandler } from './mediasoup-handler.js';
+import { verifyToken } from './auth.js';
 
-/** @type {Map<string, Set<Peer>>} - roomId → set of peers */
+/** @type {Map<string, Set<Peer>>} - roomId -> set of peers */
 const roomPeers = new Map();
 
 /**
- * Peer connection wrapper.
+ * Wrapper around a single WebSocket connection.
  */
 class Peer {
-  /** @param {WebSocket} ws */
+  /** @param {import('ws').WebSocket} ws */
   constructor(ws) {
     this.ws = ws;
-    /** @type {{ userId: string, roomId: string, role: string }} | null */
+    /** @type {{ userId: string, roomId: string, role: string }|null} */
     this.user = null;
-    this.sentCapabilities = false;
+    this.sentJoin = false;
   }
 
-  /**
-   * Send a JSON message.
-   */
+  /** Send a JSON message if the socket is open. */
   send(data) {
     if (this.ws.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify(data));
     }
   }
 
-  /**
-   * Handle incoming message.
-   */
+  /** Parse and dispatch an incoming raw message. */
   async handleMessage(raw) {
     let msg;
     try {
@@ -59,7 +58,8 @@ class Peer {
 
     logger.info(
       { type: msg.type, roomId: msg.payload?.roomId, from: msg.from, to: msg.to },
-      'Received signal message');
+      'Received signal message',
+    );
 
     try {
       switch (msg.type) {
@@ -86,131 +86,97 @@ class Peer {
     }
   }
 
-  /**
-   * Join a room: validate token, create room, broadcast capabilities.
-   */
+  /** Validate the token, register the peer in its room, and reply. */
   async handleJoinRoom(msg) {
     const { roomId, role, token } = msg.payload || {};
     if (!roomId || !role || !token) {
       this.send({ type: 'AUTH_ERROR', payload: { message: 'Missing roomId, role, or token' } });
       return;
-  }
+    }
 
-    // Validate JWT
-    let decoded;
-    try {
-      decoded = jwt.verify(token, config.jwtSecret);
-    } catch {
+    const decoded = verifyToken(token);
+    if (!decoded) {
       this.send({ type: 'AUTH_ERROR', payload: { message: 'Invalid token' } });
       return;
     }
-
     if (decoded.roomId !== roomId) {
       this.send({ type: 'AUTH_ERROR', payload: { message: 'Token room mismatch' } });
       return;
     }
 
-    this.user = decoded;
-    this.user.roomId = roomId;
-    this.user.role = decoded.role;
+    this.user = { userId: decoded.userId, roomId, role: decoded.role };
 
-    // Setup room mapping
     if (!roomPeers.has(roomId)) {
       roomPeers.set(roomId, new Set());
     }
     roomPeers.get(roomId).add(this);
 
     logger.info(
-      { roomId, userId: decoded.userId, role: decoded.role, peerCount: roomPeers.get(roomId).size },
-      `Peer joined room`);
+      { roomId, userId: decoded.email ?? decoded.userId, role: decoded.role, peerCount: roomPeers.get(roomId).size },
+      'Peer joined room',
+    );
 
-    const members = Array.from(roomPeers.get(roomId))
-      .filter((p) => p.user)
-      .map((p) => ({ userId: p.user.userId, role: p.user.role }));
-    logger.info({ roomId, members }, 'Current room members');
-
-    // Notify the other peers in the room that a new peer joined, so a
-    // controller can (re)negotiate an offer to a newly arrived viewer.
+    // Tell the other peers a new one arrived so a controller can
+    // (re)negotiate an offer to a newly joined viewer.
     this.broadcastToRoom(roomId, {
       type: 'PEER_JOINED',
       payload: { userId: decoded.userId, role: decoded.role },
     });
-    logger.info({ roomId, userId: decoded.userId, role: decoded.role }, 'Broadcast PEER_JOINED to others');
 
-    // Initialize mediasoup router for this room
-    try {
-      await mediasoupHandler.getOrCreateRouter(roomId);
-    } catch (err) {
-      logger.error({ err, roomId }, 'Failed to create/get router');
-      this.send({ type: 'AUTH_ERROR', payload: { message: 'Server media initialization failed' } });
-      return;
-    }
-
-    // Send router capabilities to this peer
-    if (!this.sentCapabilities) {
-      try {
-        // Get global mediasoup capabilities from the first router
-        const firstRouter = mediasoupHandler.rooms.get(roomId)?.router;
-        if (firstRouter) {
-          this.send({
-            type: 'ROOM_JOINED',
-            payload: {
-              routerRtpCapabilities: firstRouter.rtpCapabilities,
-              roomId,
-              role: decoded.role,
-              peers: Array.from(roomPeers.get(roomId))
-                .filter(p => p !== this && p.user)
-                .map(p => ({ userId: p.user.userId, role: p.user.role })),
-            },
-          });
-          this.sentCapabilities = true;
-        }
-      } catch (err) {
-        logger.error({ err }, 'Failed to send capabilities');
-      }
+    if (!this.sentJoin) {
+      this.send({
+        type: 'ROOM_JOINED',
+        payload: {
+          roomId,
+          role: decoded.role,
+          peers: Array.from(roomPeers.get(roomId))
+            .filter((p) => p !== this && p.user)
+            .map((p) => ({ userId: p.user.userId, role: p.user.role })),
+        },
+      });
+      this.sentJoin = true;
     }
   }
 
-  /**
-   * Relay WebRTC signaling messages between peers.
-   */
+  /** Relay WebRTC signaling (offer/answer/ICE) to the addressed peer. */
   async handleRelay(msg) {
     if (!this.user) {
       this.send({ type: 'AUTH_ERROR', payload: { message: 'Not joined to room' } });
       return;
     }
+    // A peer may only relay within its own (token-scoped) room.
+    if (msg.roomId && msg.roomId !== this.user.roomId) {
+      this.send({ type: 'AUTH_ERROR', payload: { message: 'Room mismatch' } });
+      return;
+    }
 
-    const { roomId, to } = msg;
-    const target = this.findPeerInRoom(to);
-
+    const target = this.findPeerInRoom(msg.to);
     if (target) {
-      // Inject sender ID so receiver can route ICE candidates back
-      const enriched = { ...msg, from: this.user.userId };
-      target.send(enriched);
-      logger.info({ from: this.user.userId, to, type: msg.type }, 'Message relayed');
+      // Inject the sender id so the receiver can route ICE back.
+      target.send({ ...msg, from: this.user.userId });
+      logger.info({ from: this.user.userId, to: msg.to, type: msg.type }, 'Message relayed');
     } else {
-      logger.warn({ to, roomId, type: msg.type }, 'Target peer not found — cannot relay');
+      logger.warn({ to: msg.to, type: msg.type }, 'Target peer not found — cannot relay');
       this.send({ type: 'AUTH_ERROR', payload: { message: 'Target peer not found' } });
     }
   }
 
-  /**
-   * Relay control commands (mouse/keyboard) to the controller.
-   */
+  /** Relay control commands (mouse/keyboard) to the room's controller. */
   async handleControlCommand(msg) {
     if (!this.user) {
       this.send({ type: 'AUTH_ERROR', payload: { message: 'Not joined to room' } });
       return;
     }
-
-    // Only viewers can send control commands
     if (this.user.role !== 'viewer') {
       logger.warn({ userId: this.user.userId, role: this.user.role }, 'Non-viewer attempted control');
       this.send({ type: 'AUTH_ERROR', payload: { message: 'Only viewers can send control commands' } });
       return;
     }
+    if (msg.roomId && msg.roomId !== this.user.roomId) {
+      this.send({ type: 'AUTH_ERROR', payload: { message: 'Room mismatch' } });
+      return;
+    }
 
-    // Find the controller in this room and forward the command
     const controller = this.findPeerInRoom(null, 'controller');
     if (controller) {
       controller.send(msg);
@@ -218,40 +184,25 @@ class Peer {
     }
   }
 
-  /**
-   * Leave room and clean up.
-   */
+  /** Leave the room and notify the remaining peers. */
   handleLeave() {
-    if (this.user) {
-      const { roomId, userId } = this.user;
-      logger.info({ roomId, userId }, 'Peer leaving room');
+    if (!this.user) return;
+    const { roomId, userId } = this.user;
+    logger.info({ roomId, userId }, 'Peer leaving room');
 
-      // Clean up mediasoup resources
-      mediasoupHandler.leaveRoom(roomId, userId);
-
-      // Remove from room peers
-      const peers = roomPeers.get(roomId);
-      peers?.delete(this);
-      if (peers?.size === 0) {
-        roomPeers.delete(roomId);
-        mediasoupHandler.leaveRoom(roomId);
-      }
-
-      // Notify remaining peers
-      this.broadcastToRoom(roomId, {
-        type: 'PEER_LEFT',
-        payload: { userId },
-      });
+    const peers = roomPeers.get(roomId);
+    peers?.delete(this);
+    if (peers?.size === 0) {
+      roomPeers.delete(roomId);
     }
+    this.broadcastToRoom(roomId, { type: 'PEER_LEFT', payload: { userId } });
+    this.user = null;
   }
 
-  /**
-   * Find a peer in the current room.
-   */
+  /** Find a peer in the current room by id and/or role. */
   findPeerInRoom(targetUserId, targetRole) {
     const peers = roomPeers.get(this.user?.roomId);
     if (!peers) return null;
-
     for (const peer of peers) {
       if (peer === this || !peer.user) continue;
       if (targetUserId && peer.user.userId !== targetUserId) continue;
@@ -261,13 +212,10 @@ class Peer {
     return null;
   }
 
-  /**
-   * Broadcast a message to all peers in the room except sender.
-   */
+  /** Broadcast to every other peer in the room. */
   broadcastToRoom(roomId, msg) {
     const peers = roomPeers.get(roomId);
     if (!peers) return;
-
     for (const peer of peers) {
       if (peer !== this && peer.ws.readyState === WebSocket.OPEN) {
         peer.send(msg);
@@ -277,58 +225,45 @@ class Peer {
 }
 
 /**
- * Create and attach WebSocket server to an existing HTTP server.
+ * Attach the WebSocket signal server to an existing HTTP server.
  * @param {import('http').Server} httpServer
  */
 export function setupSignalServer(httpServer) {
-  // NOTE: we deliberately do NOT pass `path: '/signal'`. Some WebSocket
-  // clients (web_socket_channel on Flutter) append a `#` fragment to the
-  // upgrade request URI (e.g. `ws://host:3000/signal#`), and `ws`'s exact
-  // path match would then reject it with HTTP 404. This is a dedicated
-  // signaling server with no other WebSocket endpoints, so accepting all
-  // upgrade requests on this port is safe.
+  // NOTE: we deliberately do NOT pin `path: '/signal'`. Some clients append a
+  // fragment/hash to the upgrade URI and an exact path match would 404. This
+  // is a dedicated signaling port, so accepting all upgrades is safe.
   const wss = new WebSocketServer({ server: httpServer });
 
   wss.on('connection', (ws, req) => {
     logger.info({ remote: req.socket.remoteAddress }, 'New WebSocket connection');
     const peer = new Peer(ws);
 
-    ws.on('message', (raw) => {
-      peer.handleMessage(raw.toString());
-    });
-
+    ws.on('message', (raw) => peer.handleMessage(raw.toString()));
     ws.on('close', (code, reason) => {
       logger.info(
         { code, reason: reason?.toString(), userId: peer.user?.userId },
-        'WebSocket closed');
+        'WebSocket closed',
+      );
       peer.handleLeave();
     });
-
     ws.on('error', (err) => {
       logger.error({ err, userId: peer.user?.userId }, 'WebSocket error');
     });
 
-    // Heartbeat / ping
+    // Heartbeat: terminate sockets that stop responding to pings.
     ws.isAlive = true;
-    ws.on('pong', () => {
-      ws.isAlive = true;
-    });
+    ws.on('pong', () => { ws.isAlive = true; });
   });
 
-  // Ping/pong heartbeat (30s interval)
   const heartbeat = setInterval(() => {
     wss.clients.forEach((ws) => {
-      if (ws.isAlive === false) {
-        return ws.terminate();
-      }
+      if (ws.isAlive === false) return ws.terminate();
       ws.isAlive = true;
       ws.ping();
     });
   }, 30000);
 
-  wss.on('close', () => {
-    clearInterval(heartbeat);
-  });
+  wss.on('close', () => clearInterval(heartbeat));
 
   logger.info('WebSocket signal server listening (accepts upgrades on any path)');
   return wss;

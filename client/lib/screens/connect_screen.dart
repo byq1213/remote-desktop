@@ -8,6 +8,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
+import '../core/logger.dart';
 import '../models/config.dart';
 import '../webrtc/screen_capture.dart';
 import 'control_screen.dart';
@@ -25,15 +26,13 @@ class _ConnectScreenState extends State<ConnectScreen> {
   final _userIdController = TextEditingController();
   final _roomIdController = TextEditingController();
 
-  // Controller-only: list of shareable displays so the user can pick which
-  // screen to share (essential with an extended display attached).
   final ScreenCaptureManager _captureProbe = ScreenCaptureManager();
   List<DesktopCapturerSource> _screens = [];
   String? _selectedSourceId;
   bool _loadingScreens = false;
 
-  // Honour `--dart-define=MODE=viewer` (see README) so the dedicated
-  // viewer window does not default to the controller/sharing role.
+  // Honour `--dart-define=MODE=viewer` so the dedicated viewer window does not
+  // default to the controller/sharing role.
   String _selectedRole = () {
     const mode = String.fromEnvironment('MODE', defaultValue: '');
     return mode == 'viewer' ? 'viewer' : 'controller';
@@ -42,8 +41,8 @@ class _ConnectScreenState extends State<ConnectScreen> {
   @override
   void initState() {
     super.initState();
-    // Debug convenience: pre-fill the room code with today's date
-    // (YYYYMMDD) and a random username, so local testing needs zero typing.
+    // Debug convenience: pre-fill the room code with today's date and a random
+    // username, so local testing needs zero typing.
     if (kDebugMode) {
       final now = DateTime.now();
       final dateStr = '${now.year}'
@@ -52,13 +51,12 @@ class _ConnectScreenState extends State<ConnectScreen> {
       _roomIdController.text = dateStr;
       _userIdController.text = '${100000 + Random().nextInt(900000)}';
     }
-    // Enumerate shareable displays up-front so the controller can pick one.
     _loadScreens();
   }
 
-  /// Enumerate the available screens (macOS). Results populate the Share
-  /// Screen picker. If it fails (e.g. permission not yet granted) we simply
-  /// skip the picker and let ScreenCaptureManager auto-pick the primary.
+  /// Enumerate the available screens (macOS). Results populate the share-screen
+  /// picker. If it fails (e.g. permission not yet granted) we simply skip the
+  /// picker and let ScreenCaptureManager auto-pick the primary.
   Future<void> _loadScreens() async {
     if (_loadingScreens) return;
     setState(() => _loadingScreens = true);
@@ -73,7 +71,7 @@ class _ConnectScreenState extends State<ConnectScreen> {
         });
       }
     } catch (e) {
-      print('ConnectScreen: listScreens failed: $e');
+      log.d('ConnectScreen: listScreens failed: $e');
       if (mounted) setState(() => _screens = []);
     } finally {
       if (mounted) setState(() => _loadingScreens = false);
@@ -88,8 +86,7 @@ class _ConnectScreenState extends State<ConnectScreen> {
     super.dispose();
   }
 
-  /// Picker for the display to share. Shows a spinner while enumerating, a
-  /// hint if none were found, or a dropdown of display names otherwise.
+  /// Picker for the display to share.
   Widget _buildScreenPicker() {
     if (_loadingScreens) {
       return const SizedBox(
@@ -106,7 +103,7 @@ class _ConnectScreenState extends State<ConnectScreen> {
         style: TextStyle(fontSize: 12, color: Colors.white38));
     }
     return DropdownButtonFormField<String>(
-      value: _selectedSourceId,
+      initialValue: _selectedSourceId,
       decoration: InputDecoration(
         labelText: 'Display to share',
         prefixIcon: const Icon(Icons.desktop_windows_outlined),
@@ -124,8 +121,7 @@ class _ConnectScreenState extends State<ConnectScreen> {
 
     final config = context.read<AppConfig>();
 
-    // IMPORTANT: apply the user-entered server URL so the connection below
-    // actually targets it (previously this field was ignored).
+    // Apply the user-entered server URL so the connection below targets it.
     final serverInput = _serverController.text.trim();
     if (serverInput.isNotEmpty) {
       config.setServerUrl(serverInput);
@@ -152,13 +148,14 @@ class _ConnectScreenState extends State<ConnectScreen> {
       );
     } else if (mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Connection failed')),
+        const SnackBar(content: Text('Connection failed. Check your details.')),
       );
     }
   }
 
   @override
   Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
     return Scaffold(
       appBar: AppBar(
         title: const Text('Remote Desktop — Connect'),
@@ -170,11 +167,11 @@ class _ConnectScreenState extends State<ConnectScreen> {
           child: Container(
             constraints: const BoxConstraints(maxWidth: 400),
             decoration: BoxDecoration(
-              color: Colors.grey[900],
+              color: scheme.surface,
               borderRadius: BorderRadius.circular(16),
               boxShadow: [
                 BoxShadow(
-                  color: Colors.black.withOpacity(0.3),
+                  color: Colors.black.withValues(alpha: 0.3),
                   blurRadius: 20,
                   offset: const Offset(0, 8),
                 ),
@@ -188,8 +185,8 @@ class _ConnectScreenState extends State<ConnectScreen> {
                   mainAxisSize: MainAxisSize.min,
                   crossAxisAlignment: CrossAxisAlignment.stretch,
                   children: [
-                    // Title
-                    Icon(Icons.computer, size: 48, color: Colors.deepPurple[200]),
+                    Icon(Icons.computer,
+                        size: 48, color: scheme.primary.withValues(alpha: 0.8)),
                     const SizedBox(height: 16),
                     Text(
                       'Remote Desktop',
@@ -200,62 +197,43 @@ class _ConnectScreenState extends State<ConnectScreen> {
                       ),
                     ),
                     const SizedBox(height: 8),
-                    Text(
-                      'Enter connection details',
+                    Text('Enter connection details',
                       textAlign: TextAlign.center,
-                      style: TextStyle(color: Colors.grey[400]),
-                    ),
+                      style: TextStyle(color: Colors.grey[400])),
                     const SizedBox(height: 32),
-
-                    // Server URL
                     TextFormField(
                       controller: _serverController,
                       decoration: InputDecoration(
                         labelText: 'Server URL',
                         hintText: 'e.g. http://192.168.1.10:3000',
-                        helperText: 'Default points to a local server. Change it to reach a remote one.',
                         prefixIcon: const Icon(Icons.cloud_outlined),
-                        border: OutlineInputBorder(
-                          borderRadius: BorderRadius.circular(8),
-                        ),
+                        border: OutlineInputBorder(borderRadius: BorderRadius.circular(8)),
                       ),
                       validator: (v) => v == null || v.isEmpty ? 'Required' : null,
                     ),
                     const SizedBox(height: 16),
-
-                    // User ID
                     TextFormField(
                       controller: _userIdController,
                       decoration: InputDecoration(
                         labelText: 'Your Name',
                         hintText: 'e.g. alice',
-                        helperText: 'Example only — type your own name (required).',
                         prefixIcon: const Icon(Icons.person_outline),
-                        border: OutlineInputBorder(
-                          borderRadius: BorderRadius.circular(8),
-                        ),
+                        border: OutlineInputBorder(borderRadius: BorderRadius.circular(8)),
                       ),
                       validator: (v) => v == null || v.isEmpty ? 'Required' : null,
                     ),
                     const SizedBox(height: 16),
-
-                    // Room ID
                     TextFormField(
                       controller: _roomIdController,
                       decoration: InputDecoration(
                         labelText: 'Room Code',
                         hintText: 'e.g. meeting-01',
-                        helperText: 'Example only — type a shared code (required).',
                         prefixIcon: const Icon(Icons.meeting_room_outlined),
-                        border: OutlineInputBorder(
-                          borderRadius: BorderRadius.circular(8),
-                        ),
+                        border: OutlineInputBorder(borderRadius: BorderRadius.circular(8)),
                       ),
                       validator: (v) => v == null || v.isEmpty ? 'Required' : null,
                     ),
                     const SizedBox(height: 16),
-
-                    // Role selector — explicit, can't-miss choice.
                     const Text('Role',
                       style: TextStyle(fontSize: 12, color: Colors.white70)),
                     const SizedBox(height: 8),
@@ -285,20 +263,14 @@ class _ConnectScreenState extends State<ConnectScreen> {
                       _buildScreenPicker(),
                     ],
                     const SizedBox(height: 32),
-
-                    // Connect button
                     ElevatedButton(
                       onPressed: _handleConnect,
                       style: ElevatedButton.styleFrom(
                         padding: const EdgeInsets.symmetric(vertical: 16),
-                        shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(8),
-                        ),
+                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
                       ),
-                      child: Text(
-                        'Connect',
-                        style: Theme.of(context).textTheme.titleLarge,
-                      ),
+                      child: Text('Connect',
+                        style: Theme.of(context).textTheme.titleLarge),
                     ),
                   ],
                 ),

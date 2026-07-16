@@ -12,7 +12,7 @@
 | Dart SDK | 3.2+ | Flutter depends on |
 | Node.js | 20 LTS | Server runtime |
 | npm | 10+ | Package manager |
-| C++ Build Tools | Xcode CLT / Visual Studio Build Tools | mediasoup native bindings |
+| C++ Build Tools | Xcode CLT / Visual Studio Build Tools | (only if building native deps such as flutter-webrtc) |
 | Git | Latest | Version control |
 
 ### macOS Specific
@@ -73,17 +73,15 @@ remote-desktop/
 │   ├── pubspec.yaml
 │   └── analysis_options.yaml
 │
-├── server/               # Node.js mediasoup server
+├── server/               # Node.js signaling relay (no media server)
 │   ├── src/
 │   │   ├── index.js
 │   │   ├── signal-server.js
-│   │   ├── mediasoup-handler.js
 │   │   ├── auth.js
 │   │   └── utils/
 │   ├── package.json
 │   └── .env.example
 │
-├── docker-compose.yml    # Optional: mediasoup + TURN in Docker
 └── README.md
 ```
 
@@ -110,8 +108,6 @@ Create `server/.env`:
 ```env
 PORT=3000
 JWT_SECRET=your-secret-key-here
-MEDiasoup_LOG_LEVEL=warning
-MEDiasoup_LOG_ICONS=false
 TURN_SERVER=turn:your-server.com:3478
 TURN_USERNAME=remote-user
 TURN_PASSWORD=secure-password
@@ -170,14 +166,12 @@ cd client && flutter build windows --release
 
 ### Docker (Optional)
 
-```bash
-# Starts mediasoup + coturn in Docker
-docker compose up -d
+A Docker setup is optional and only needs to provide the signaling service plus
+(cross-network) a TURN relay — there is no media server to containerize:
 
-# Points server to Docker media server
-MEDIASOUP_LISTEN_IP=127.0.0.1 \
-MEDIASOUP_announcedIp=your-external-ip \
-npm run dev
+```bash
+# Example: run the signaling server and a coturn TURN relay
+docker compose up -d
 ```
 
 ---
@@ -219,19 +213,19 @@ flutter build macos
 nc -zv turn.your-server.com 3478
 
 # Enable verbose logging on server
-DEBUG=mediasoup:* npm run dev
+DEBUG=* npm run dev
 ```
 
 ### Issue: Viewer shows black screen
 
-- Verify Controller has screen capture enabled (check tray icon or status bar)
-- Check mediasoup producer state: `GET /api/rooms/:roomId/stats`
-- Try lowering resolution: set `_targetBitrate` to 1Mbps in `screen_capture.dart`
+- Verify Controller has screen capture enabled (check status bar / onCaptureError toast)
+- Confirm the WebRTC connection reached `connected` (HUD shows FPS > 0)
+- Try lowering resolution: set a smaller `TARGET_LONG_SIDE` via `--dart-define=TARGET_LONG_SIDE=1920`
 
 ### Issue: Mouse events not reaching Controller
 
 - Check WebSocket connection: open DevTools in Viewer → Network tab → WS tab
-- Verify `CONTROL_CMD` message is received by server
+- Verify `MOUSE_EVENT` / `KEY_EVENT` messages are received by server
 - Check Controller's input permissions (Accessibility on macOS)
 
 ---
@@ -243,16 +237,15 @@ DEBUG=mediasoup:* npm run dev
 ```bash
 cd client
 flutter test
-flutter test test/webrtc/        # WebRTC specific tests
-flutter test test/input/         # Input handler tests
+flutter test test/resolution_test.dart   # stride-safe resolution / protocol helpers
 ```
 
-### API Tests (Server)
+### API / Integration Tests (Server)
 
 ```bash
 cd server
-npm test                          # Jest unit tests
-npm run test:integration          # WebSocket + mediasoup integration
+npm test                          # Jest unit tests (if present)
+# Manual: connect a Controller + Viewer, verify OFFER/ANSWER/ICE relay and input replay
 ```
 
 ### Manual Smoke Test Checklist

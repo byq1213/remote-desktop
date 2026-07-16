@@ -1,4 +1,9 @@
 /// WebRTC peer connection manager for sending/receiving screen video.
+///
+/// Owns the [RTCPeerConnection] lifecycle: offer/answer exchange, ICE
+/// candidate forwarding, media-track management, and the stride-safe local
+/// preview loopback. Resolution/stride math lives in `utils/resolution.dart`
+/// so it can be unit-tested in isolation.
 library;
 
 import 'dart:async';
@@ -6,192 +11,132 @@ import 'dart:math';
 
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 
-/// Manages the WebRTC PeerConnection lifecycle.
-/// Handles offer/answer exchange, ICE candidates, and media tracks.
+import '../core/logger.dart';
+import '../utils/resolution.dart';
+
+/// Real, measured media statistics for the HUD.
+class MediaStats {
+  final double fps;
+  final double rttMs;
+  final int packetsLost;
+  const MediaStats({this.fps = 0, this.rttMs = 0, this.packetsLost = 0});
+  static const MediaStats empty = MediaStats();
+}
+
 class PeerManager {
-  /// Target maximum length (px) of the long side of the outgoing screen
-  /// video. Higher = sharper viewer image but more bandwidth/CPU. Tunable at
-  /// build time via --dart-define=TARGET_LONG_SIDE=<px> (e.g. 3840 for 4K).
+  /// Target maximum length (px) of the long side of the outgoing screen video.
+  /// Higher = sharper viewer image but more bandwidth/CPU. Tunable at build
+  /// time via `--dart-define=TARGET_LONG_SIDE=<px>` (e.g. 3840 for 4K).
   static const int kDefaultTargetLongSide =
       int.fromEnvironment('TARGET_LONG_SIDE', defaultValue: 2560);
+
   RTCPeerConnection? _pc;
-  MediaStream? _localStream;
+  MediaStream? localStream;
   final List<Function(MediaStream)> _onRemoteStreamListeners = [];
   final Map<String, RTCRtpSender> _senders = {};
   Function(RTCIceCandidate)? _externalIceCallback;
 
   // Local-preview loopback: a second PeerConnection pair that re-encodes the
   // (possibly non-64-aligned) raw capture and decodes it back so the preview
-  // renderer gets a stride-safe frame (see startLocalPreviewLoopback).
+  // renderer gets a stride-safe frame.
   RTCPeerConnection? _lbSend;
   RTCPeerConnection? _lbRecv;
   MediaStream? _localPreviewStream;
 
-  /// Callback when remote stream is received.
   void onRemoteStream(Function(MediaStream) callback) {
     _onRemoteStreamListeners.add(callback);
   }
 
-  /// Register an external handler for locally-generated ICE candidates.
-  /// Called by ConnectionManager to forward candidates to the remote peer via server.
   void setIceCallback(Function(RTCIceCandidate) callback) {
     _externalIceCallback = callback;
   }
 
-  /// Create and configure PeerConnection.
   Future<void> initialize({
     required List<Map<String, dynamic>> iceServers,
     required bool isController,
   }) async {
     _pc = await createPeerConnection(
-      {
-        'iceServers': iceServers,
-      },
-      {
-        'voice': false,
-        'datachannels': false,
-        'video': true,
-      },
+      {'iceServers': iceServers},
+      {'voice': false, 'datachannels': false, 'video': true},
     );
 
-    // Handle remote tracks
     _pc!.onTrack = (RTCTrackEvent event) {
-      print('PeerManager: onTrack event, streams=${event.streams.length}, '
-          'tracks=${event.track != null ? 1 : 0}');
-      if (event.streams.isNotEmpty) {
-        for (final stream in event.streams) {
-          for (final track in stream.getTracks()) {
-            if (track.kind == 'video') {
-              print('PeerManager: remote VIDEO track received (${stream.id})');
-              for (final listener in List.from(_onRemoteStreamListeners)) {
-                listener(stream);
-              }
+      log.d('PeerManager: onTrack streams=${event.streams.length}');
+      for (final stream in event.streams) {
+        for (final track in stream.getTracks()) {
+          if (track.kind == 'video') {
+            log.d('PeerManager: remote VIDEO track received (${stream.id})');
+            for (final listener in List.from(_onRemoteStreamListeners)) {
+              listener(stream);
             }
           }
         }
       }
     };
 
-    // Handle ICE candidates — forward to external callback for server relay
     _pc!.onIceCandidate = (RTCIceCandidate candidate) {
-      print('PeerManager: local ICE candidate (mid=${candidate.sdpMid}, '
-          'foundation=${candidate.candidate?.substring(0, 20)})');
+      log.d('PeerManager: local ICE candidate (mid=${candidate.sdpMid})');
       _externalIceCallback?.call(candidate);
     };
 
-    // Handle connection state changes
     _pc!.onIceConnectionState = (state) {
-      print('PeerManager: ICE connection state = $state');
+      log.d('PeerManager: ICE connection state = $state');
     };
 
     _pc!.onConnectionState = (state) {
-      print('PeerManager: PeerConnection state = $state');
+      log.d('PeerManager: PeerConnection state = $state');
     };
 
-    print('PeerManager initialized (controller: $isController)');
+    log.d('PeerManager initialized (controller: $isController)');
   }
 
-  /// Create and set local SDP offer.
   Future<RTCSessionDescription> createOffer() async {
     final offer = await _pc!.createOffer();
-    final preferred =
-        _preferCodec(offer.sdp ?? '', 'VP8') ?? offer.sdp ?? '';
+    final preferred = preferCodec(offer.sdp ?? '', 'VP8') ?? offer.sdp ?? '';
     final desc = RTCSessionDescription(preferred, offer.type);
     await _pc!.setLocalDescription(desc);
     return desc;
   }
 
-  /// Create and set local SDP answer.
   Future<RTCSessionDescription> createAnswer() async {
     final answer = await _pc!.createAnswer();
-    final preferred =
-        _preferCodec(answer.sdp ?? '', 'VP8') ?? answer.sdp ?? '';
+    final preferred = preferCodec(answer.sdp ?? '', 'VP8') ?? answer.sdp ?? '';
     final desc = RTCSessionDescription(preferred, answer.type);
     await _pc!.setLocalDescription(desc);
     return desc;
   }
 
-  /// Reorder the m=video payload types so the given codec (e.g. VP8) is
-  /// first, steering macOS WebRTC away from the flaky H.264 VideoToolbox
-  /// screencast path. Returns null if the codec isn't present.
-  String? _preferCodec(String sdp, String codec) {
-    final videoMatch = RegExp(r'm=video.*').firstMatch(sdp);
-    if (videoMatch == null) return null;
-    final codecMatch =
-        RegExp(r'a=rtpmap:(\d+) $codec/90000').firstMatch(sdp);
-    if (codecMatch == null) return null;
-    final pt = codecMatch.group(1)!;
-    final mLine = videoMatch.group(0)!;
-    final parts = mLine.split(' ');
-    if (parts.length < 4) return null;
-    final head = parts.take(3).join(' ');
-    final rest = parts.skip(3).where((p) => p != pt).join(' ');
-    return sdp.replaceFirst(mLine, '$head $pt $rest');
-  }
-
-  /// Set remote description (offer or answer received from peer).
   Future<void> setRemoteDescription(RTCSessionDescription sdp) async {
     await _pc!.setRemoteDescription(sdp);
   }
 
-  /// Add ICE candidate received from peer.
   Future<void> addIceCandidate(RTCIceCandidate candidate) async {
     await _pc!.addCandidate(candidate);
   }
 
-  /// Set remote description with type and SDP string.
   Future<void> setRemoteDescriptionWithType(String type, String sdp) async {
     await _pc!.setRemoteDescription(RTCSessionDescription(sdp, type));
   }
 
-  /// Add all local media tracks (used by controller for screen capture).
-  ///
-  /// [width]/[height] are the *best-known* capture dimensions at add time
-  /// (the controller derives them from the display's logical size × DPR before
-  /// the raw frame arrives). Passing them here applies the correct 64-aligned
-  /// encoder scale IMMEDIATELY — crucial because on macOS a later
-  /// `setParameters(scaleResolutionDownBy)` frequently does NOT re-apply, so
-  /// the scale set at addTrack time is what the viewer actually receives.
   Future<List<RTCRtpSender>> addTracks(MediaStream stream,
       {int? width, int? height, double? maxLongSide}) async {
     maxLongSide ??= kDefaultTargetLongSide.toDouble();
     final senders = <RTCRtpSender>[];
     for (final track in stream.getTracks()) {
-      print('PeerManager: adding local ${track.kind} track');
+      log.d('PeerManager: adding local ${track.kind} track');
       final sender = await _pc!.addTrack(track, stream);
       _senders[track.id!] = sender;
       senders.add(sender);
     }
     // macOS getDisplayMedia ignores the capture `max` constraint and hands
-    // back the *entire* virtual desktop when an external display is attached
-    // (e.g. 3840x4072 — a near-square, ~15.6M-pixel frame). Scale the long
-    // side down to <= [maxLongSide] at the encoder so the viewer gets a
-    // renderable frame. This is the real fix; the capture-side `max` cap is
-    // ineffective.
-    _capOutgoingResolution(senders,
+    // back the entire virtual desktop when an external display is attached.
+    // Scale the long side down at the encoder so the viewer gets a renderable
+    // frame; this is the real fix (the capture-side cap is ineffective).
+    _rescaleSenders(senders,
         width: width, height: height, maxLongSide: maxLongSide);
     return senders;
   }
 
-  /// Scale outgoing video encodings so the long side is at most
-  /// [maxLongSide] px. Reads the real capture size from [width]/[height]
-  /// when given, else from the track's settings; falls back to sending the
-  /// source as-is (scale 1.0) — NOT a 2x downscale — so an unknown size
-  /// is never silently halved. This keeps even large single displays
-  /// renderable on the viewer while preserving the source's aspect ratio.
-  void _capOutgoingResolution(List<RTCRtpSender> senders,
-      {int? width, int? height, double? maxLongSide}) {
-    maxLongSide ??= kDefaultTargetLongSide.toDouble();
-    _rescaleSenders(senders,
-        width: width, height: height, maxLongSide: maxLongSide);
-  }
-
-  /// Re-apply the resolution cap using the *actual* captured dimensions. Call
-  /// this after the local preview paints its first frame so we scale from the
-  /// real source size (read from [width]/[height]) instead of an estimate.
-  ///
-  /// [dpr] is the source display's device-pixel-ratio (physical ÷ logical).
-  /// Passing it lets us pick a HiDPI-aware target (see [_scaleFor]).
   void rescaleOutgoing(
       {int? width, int? height, double? maxLongSide, double dpr = 1.0}) {
     maxLongSide ??= kDefaultTargetLongSide.toDouble();
@@ -200,20 +145,8 @@ class PeerManager {
         width: width, height: height, maxLongSide: maxLongSide, dpr: dpr);
   }
 
-  /// The stride-safe, decoded local-preview stream produced by the loopback
-  /// PeerConnection pair (null until/unless the loopback is established).
   MediaStream? get localPreviewStream => _localPreviewStream;
 
-  /// Produce a stride-safe local-preview stream by looping the captured
-  /// [source] back through a second PeerConnection pair.
-  ///
-  /// On macOS `getDisplayMedia` ignores the requested capture size and returns
-  /// a non-64-aligned frame (e.g. 2940x1912). The Flutter renderer's texture
-  /// uploader assumes `width × 4` row stride, so such a frame is sheared in the
-  /// local preview. Re-encoding + decoding the frame through libwebrtc
-  /// resamples it to a 64-aligned size (driven by [w]/[h]), which the renderer
-  /// then shows without shear. Returns the decoded stream, or null if the
-  /// loopback could not be established (caller falls back to the raw source).
   Future<MediaStream?> startLocalPreviewLoopback(
     MediaStream source,
     int w,
@@ -236,7 +169,7 @@ class PeerManager {
       recv.onTrack = (RTCTrackEvent e) {
         if (e.streams.isNotEmpty && !got.isCompleted) {
           _localPreviewStream = e.streams.first;
-          print('PeerManager: loopback preview stream id='
+          log.d('PeerManager: loopback preview stream id='
               '${_localPreviewStream!.id} (must differ from raw capture id)');
           got.complete(_localPreviewStream!);
         }
@@ -244,38 +177,23 @@ class PeerManager {
       // NOTE: deliberately NO trickle ICE here. Exchanging candidates via
       // onIceCandidate risks feeding them to the peer before its remote
       // description is set, which silently drops them; ICE then never
-      // connects and the loopback times out — leaving the raw (sheared)
-      // capture on screen (the "1470x956 twisted, 1280x832 fine" symptom,
-      // because the 64-aligned size needs no loopback at all). Instead we
-      // wait for gathering to complete and embed the candidates in the SDP
-      // (non-trickle) so both sides learn them *after* setRemoteDescription.
-      // Use a FRESH stream with a unique id for the loopback send. The decoded
-      // preview stream will then carry a DIFFERENT id than the raw capture
-      // stream — essential because RTCVideoRenderer keys srcObject swaps on the
-      // stream id. Reusing the raw id makes it skip the swap and keep showing
-      // the original (sheared) frame; a unique id forces a real re-bind to the
-      // stride-safe 1408x916 (or similar) preview.
+      // connects and the loopback times out. Instead we wait for gathering to
+      // complete and embed the candidates in the SDP (non-trickle).
       for (final t in source.getTracks()) {
         final loopSrc = await createLocalMediaStream(
             'loopback-src-${DateTime.now().microsecondsSinceEpoch}');
         await send.addTrack(t, loopSrc);
       }
-      // Scale the loopback sender to a 64-aligned size from the real capture.
       final lbSenders = await send.getSenders();
       _rescaleSenders(lbSenders,
           width: w, height: h, maxLongSide: maxLongSide, dpr: dpr);
-      // IMPORTANT: prefer VP8 for the loopback too. The *main* PeerConnection
-      // reorders m=video to put VP8 first (see createOffer/createAnswer) to
-      // avoid macOS's flaky H.264 VideoToolbox screencast path. If we DON'T do
-      // the same here, the loopback re-encodes the (non-64-aligned) capture
-      // through H.264 and the decoded preview comes out sheared again. VP8
-      // keeps the loopback preview stride-safe on every size.
+      // IMPORTANT: prefer VP8 for the loopback too (see createOffer/createAnswer)
+      // so the re-encoded preview stays stride-safe on every size.
       final offer = await send.createOffer();
-      final offerSdp0 = _preferCodec(offer.sdp ?? '', 'VP8') ?? offer.sdp ?? '';
+      final offerSdp0 = preferCodec(offer.sdp ?? '', 'VP8') ?? offer.sdp ?? '';
       await send.setLocalDescription(
-          RTCSessionDescription(offerSdp0, offer.type)); // VP8 + start gather
+          RTCSessionDescription(offerSdp0, offer.type));
       await _waitForIceGathering(send);
-      // Local description now carries VP8 ordering AND embedded candidates.
       final offerFinal =
           (await send.getLocalDescription())?.sdp ?? offerSdp0;
       await recv.setRemoteDescription(
@@ -283,9 +201,9 @@ class PeerManager {
 
       final answer = await recv.createAnswer();
       final answerSdp0 =
-          _preferCodec(answer.sdp ?? '', 'VP8') ?? answer.sdp ?? '';
+          preferCodec(answer.sdp ?? '', 'VP8') ?? answer.sdp ?? '';
       await recv.setLocalDescription(
-          RTCSessionDescription(answerSdp0, answer.type)); // VP8 + start gather
+          RTCSessionDescription(answerSdp0, answer.type));
       await _waitForIceGathering(recv);
       final answerFinal =
           (await recv.getLocalDescription())?.sdp ?? answerSdp0;
@@ -294,19 +212,16 @@ class PeerManager {
       final stream = await got.future.timeout(const Duration(seconds: 15));
       _lbSend = send;
       _lbRecv = recv;
-      print('PeerManager: local preview loopback ready (${stream.id})');
+      log.d('PeerManager: local preview loopback ready (${stream.id})');
       return stream;
     } catch (e) {
-      print('PeerManager: local preview loopback failed: $e');
+      log.warning('PeerManager: local preview loopback failed: $e');
       send?.close();
       recv?.close();
       return null;
     }
   }
 
-  /// Wait until ICE gathering completes so candidates are embedded in the
-  /// local description (non-trickle exchange). Guards against an already-
-  /// complete state and against gathering that never reports completion.
   Future<void> _waitForIceGathering(RTCPeerConnection pc) {
     final completer = Completer<void>();
     var done = false;
@@ -317,17 +232,16 @@ class PeerManager {
       }
     }
 
-    // Already complete before we subscribed? Don't wait.
-    if (pc.iceGatheringState == RTCIceGatheringState.RTCIceGatheringStateComplete) {
+    if (pc.iceGatheringState ==
+        RTCIceGatheringState.RTCIceGatheringStateComplete) {
       finish();
       return completer.future;
     }
     pc.onIceGatheringState = (RTCIceGatheringState state) {
       if (state == RTCIceGatheringState.RTCIceGatheringStateComplete) finish();
     };
-    // Safety net: never block the loopback handshake if the callback never
-    // fires (e.g. gathering already complete before we subscribed).
-    return completer.future.timeout(const Duration(seconds: 8), onTimeout: finish);
+    return completer.future
+        .timeout(const Duration(seconds: 8), onTimeout: finish);
   }
 
   void _rescaleSenders(List<RTCRtpSender> senders,
@@ -335,8 +249,7 @@ class PeerManager {
     maxLongSide ??= kDefaultTargetLongSide.toDouble();
     for (final sender in senders) {
       final track = sender.track;
-      if (track == null) continue;
-      if (track.kind != 'video') continue;
+      if (track == null || track.kind != 'video') continue;
       try {
         var w = width;
         var h = height;
@@ -349,13 +262,10 @@ class PeerManager {
             // getSettings unsupported for this source — fall through to estimate
           }
         }
-        final scale = _scaleFor(w, h, maxLongSide, dpr: dpr);
+        final scale = scaleFor(w, h, maxLongSide, dpr: dpr);
 
-        // Pick a bitrate that keeps the (downscaled) frame crisp. Screen
-        // content needs more bits than a webcam feed; ~2.5 bits per output
-        // pixel·second yields ~5 Mbps @1080p and ~9 Mbps @1440p, clamped to
-        // a sane [2,16] Mbps window so low-res stays cheap and high-res stays
-        // sharp without exploding the bitrate on weak links.
+        // ~2.5 bits per output pixel·second (~5 Mbps @1080p, ~9 Mbps @1440p),
+        // clamped to a sane [2,16] Mbps window.
         final lw = (w ?? 0).toDouble();
         final lh = (h ?? 0).toDouble();
         final outLong = max(lw, lh) / scale;
@@ -390,105 +300,49 @@ class PeerManager {
         }
         params.encodings = encodings;
         sender.setParameters(params);
-        print('PeerManager: outgoing video scale=$scale bitrate=$bitrate '
+        log.d('PeerManager: outgoing video scale=$scale bitrate=$bitrate '
             '(longSide<=${maxLongSide.toInt()}, src=${w ?? '?'}x${h ?? '?'})');
       } catch (e) {
-        print('PeerManager: failed to set outgoing resolution: $e');
+        log.warning('PeerManager: failed to set outgoing resolution: $e');
       }
     }
   }
 
-  /// Compute the downscale factor so the longer side fits within [maxLongSide]
-  /// while keeping the source aspect ratio. Returns 1.0 when no scaling is
-  /// needed *and* the frame is already 64-aligned.
-  ///
-  /// ## Why width must be 64-aligned (but height only needs to be even)
-  /// The shear we actually hit is a macOS *row-stride* problem: a captured or
-  /// encoded frame's `bytesPerRow` is aligned to 256 bytes, so `width × 4` must
-  /// be a multiple of 256 → **width a multiple of 64**. Height is independent of
-  /// the per-row stride, so it only needs to be EVEN (so the chroma plane can be
-  /// sampled); it does NOT need to be 64-aligned. Force-aligning height to 64
-  /// needlessly crushes ordinary screens (1080/1200/1440/2160 are none of them)
-  /// — e.g. a 1080p screen was being downscaled to 1024×576 just to satisfy a
-  /// bogus height constraint. Aligning to 16 (VP8 macroblock size) is NOT enough
-  /// for width — a 16-aligned width like 1376 gives bytesPerRow=5504, still not
-  /// ÷256, so the viewer would shear. But height only needs evenness. The old
-  /// code only aligned the *budget* and applied one uniform
-  /// `scaleResolutionDownBy`, so the short side frequently landed on a non-64
-  /// value — exactly the Retina bug: a 1080p external screen needs no scaling
-  /// (and is 64-aligned on width), while a Retina screen always needs scaling.
-  ///
-  /// ## Dynamic HiDPI budget ([dpr])
-  /// A Retina screen's *physical* pixel count is `dpr×` its *logical* size (the
-  /// size the user actually sees). Scaling down by ≈ dpr lands on that logical
-  /// resolution — crisp and correctly proportioned — instead of blind-squashing
-  /// a ~3000px-wide frame into 1920. For a DPR-1 external screen [dpr] is 1.0
-  /// and this is a no-op.
-  double _scaleFor(int? w, int? h, double maxLongSide, {double dpr = 1.0}) {
-    // Unknown dimensions: send at native size (1.0) rather than halving.
-    // A 2.0 fallback here would permanently crush resolution because, on
-    // macOS, a later setParameters(scaleResolutionDownBy) often does NOT
-    // re-apply — so this initial value is what the viewer keeps.
-    if (w == null || h == null || w <= 0 || h <= 0) return 1.0;
-    final longSide = (w > h ? w : h).toDouble();
-    final shortSide = (w < h ? w : h).toDouble();
-    // Only the WIDTH needs 64 alignment (its row stride `width×4` must be ÷256).
-    // HEIGHT is independent of per-row stride and only needs to be EVEN for
-    // chroma sampling, so we keep a separate `block` (64) for width checks and
-    // require only evenness for height. Forcing height to 64 crushed normal
-    // screens (e.g. 1080p → 1024×576), which is wrong.
-    const block = 64;
-
-    // Adaptive budget for HiDPI: prefer the display's logical long side when
-    // it is smaller than the hard cap, so Retina shares at its natural size.
-    var budget = maxLongSide;
-    if (dpr > 1.0) {
-      final logicalLong = longSide / dpr;
-      budget = logicalLong < maxLongSide ? logicalLong : maxLongSide;
+  /// Real, measured media statistics (fps, RTT, packet loss) for the HUD.
+  /// Falls back to [MediaStats.empty] if the connection isn't ready.
+  Future<MediaStats> getStats() async {
+    final pc = _pc;
+    if (pc == null) return MediaStats.empty;
+    try {
+      final reports = await pc.getStats();
+      double fps = 0;
+      double rttMs = 0;
+      int packetsLost = 0;
+      for (final r in reports) {
+        final v = r.values;
+        final isVideo = v['kind'] == 'video' || v['mediaType'] == 'video';
+        if ((r.type == 'inbound-rtp' || r.type == 'outbound-rtp') && isVideo) {
+          final f = (v['framesPerSecond'] as num?)?.toDouble();
+          if (f != null && f > 0) fps = f;
+          final lost = (v['packetsLost'] as num?)?.toInt();
+          if (lost != null) packetsLost = lost;
+        }
+        if (r.type == 'candidate-pair' && v['state'] == 'succeeded') {
+          final rtt = (v['currentRoundTripTime'] as num?)?.toDouble();
+          if (rtt != null) rttMs = rtt * 1000;
+        }
+      }
+      return MediaStats(fps: fps, rttMs: rttMs, packetsLost: packetsLost);
+    } catch (e) {
+      log.warning('PeerManager: getStats failed: $e');
+      return MediaStats.empty;
     }
-
-    // If it fits AND width is 64-aligned (stride-safe) AND height is even
-    // (chroma-safe), send as-is — no downscale.
-    if (longSide <= budget && w % block == 0 && h % 2 == 0) return 1.0;
-
-    // Find the largest target long side (a multiple of `block`, and no greater
-    // than min(budget, native long side) so we never upscale) such that the
-    // SCALED WIDTH is a multiple of `block` (stride-safe) and the SCALED HEIGHT
-    // is even (chroma-safe). Shrink the long side in `block` steps until the
-    // short side lands on an even value.
-    var target = ((min(budget, longSide).toInt() ~/ block) * block);
-    if (target < block) target = block;
-    while (target >= block) {
-      final scale = longSide / target;
-      final shortOut = _roundEven(shortSide / scale);
-      if (shortOut % 2 == 0) break;
-      target -= block;
-    }
-    return longSide / target;
   }
 
-  /// Round to the nearest EVEN number, matching how libwebrtc's scaler snaps
-  /// each output dimension (it never emits odd widths/heights).
-  int _roundEven(double v) {
-    var r = v.round();
-    if (r.isOdd) r += 1;
-    return r;
-  }
-
-  /// Get local stream (for controller's screen capture).
-  MediaStream? get localStream => _localStream;
-
-  /// Set local stream (for controller).
-  set localStream(MediaStream? stream) {
-    _localStream = stream;
-  }
-
-  /// Pause/resume the connection.
   Future<void> pause() async {
     await _pc?.close();
   }
 
-  /// Resume the connection.
   Future<void> resume({
     required List<Map<String, dynamic>> iceServers,
     required bool isController,
@@ -496,9 +350,8 @@ class PeerManager {
     await initialize(iceServers: iceServers, isController: isController);
   }
 
-  /// Clean up resources.
   void dispose() {
-    _localStream?.dispose();
+    localStream?.dispose();
     _pc?.close();
     _lbSend?.close();
     _lbRecv?.close();

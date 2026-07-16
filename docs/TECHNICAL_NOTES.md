@@ -100,6 +100,12 @@ URL 被破坏（`ws://` 被改成 `http://`、结尾被追加 `#` 片段），�
 - 采集端（`screen_capture.dart`）：约束只限制「长边」（`max: cap`）而非宽高各自设死，保留源宽高比，横竖屏都不失真。
 - 观看端 `_fitVideoBox`：外层容器按远端真实宽高比动态计算尺寸，内层 `RTCVideoView` 用 Fill，竖屏源正常显示为竖屏。
 
+**症状配图：**
+- 分辨率被压低（画面发虚、细节丢失）：
+  ![分辨率太低问题](./screenshot/分辨率太低问题.png)
+- Controller 端画面被拉伸/扭曲（比例失真）：
+  ![controller 端扭曲的分辨率](./screenshot/controller端扭曲的分辨率.png)
+
 ---
 
 ## 9. 可观测性增强（便于后续排障）
@@ -196,7 +202,7 @@ URL 被破坏（`ws://` 被改成 `http://`、结尾被追加 `#` 片段），�
 
 ### 13.5 技术债 / 值得注意的点
 
-- **鼠标节流未真正启用**：`InputEventHandler` 实现了 ~60Hz `Timer` 合并节流（`event_handler.dart:57`），`_setupViewer` 也实例化了 `_inputHandler` 并绑定发送回调，但 **UI 实际直接调用 `ConnectionManager.sendInputMouse`，从未调用 `_inputHandler.onMouseMove` 等方法**（全仓搜索 0 处调用）。结果是每次 `onPointerMove` 都立即发信令，**节流逻辑目前是死代码**。建议二选一：让 UI 走 `_inputHandler.onMouseMove` 获得节流，或删除未接线的 `InputEventHandler`。
+- **鼠标节流（已清理）**：早期 `InputEventHandler` 实现了 ~60Hz `Timer` 合并节流，但 UI 实际从未调用它（死代码）。在后续重构中已**删除 `lib/input/event_handler.dart`**，Viewer 捕获统一在 `control_screen.dart` 经 `Listener`/`Focus` 直接走 `ConnectionManager.sendInputMouse`/`sendInputKey`，`InputController` 只负责 Controller 端的回放（`applyRemoteMouse`/`applyRemoteKey`）。**副作用**：目前每次 `onPointerMove` 都立即发信令，没有节流；若需降带宽，应在 UI 层重新引入节流（例如对 pointer move 做 coalesce/节流），而不是恢复已删的单独类。
 - **默认屏幕尺寸兜底**：`_localScreenSize` 默认 `1920×1080`，读取失败才用；若主屏非此尺寸且读取异常，坐标会系统性偏移。
 - **键盘走 `usbHidUsage` 低 16 位**：`& 0xFFFF` 合理，但跨平台（Windows/Linux）需各自键码映射，当前仅 macOS 实现。
 
@@ -222,6 +228,7 @@ URL 被破坏（`ws://` 被改成 `http://`、结尾被追加 `#` 片段），�
 | `client/lib/screens/control_screen.dart` | #8 渲染器时序与比例、#9 日志、#10 全屏、#11 退出黑屏、#13 输入捕获 |
 | `client/macos/Runner/Info.plist` | #3 屏幕录制权限声明 |
 | `server/src/signal-server.js` | #1 放开 path、#5 PEER_JOINED/peers、#9 日志与容错 |
-| `client/lib/input/event_handler.dart` | #12 重命名为 Remote*Event、真实坐标上报（节流当前未接线，见 #13.5） |
+| `client/lib/input/input_controller.dart` | Controller 端输入回放（`applyRemoteMouse`/`applyRemoteKey`）；Viewer 捕获已移到 `control_screen.dart` |
+| `client/lib/utils/resolution.dart` | 步长安全的分辨率/编码纯函数（`scaleFor`/`resolveCaptureSize`/`preferCodec`/`buildWsUrl`），含单测 |
 | `client/lib/screens/connect_screen.dart` | #2 应用服务器地址、#9 调试预填/角色、#12 foundation 导入 |
 | `client/macos/Runner/MainFlutterWindow.swift` | #13 远程输入 MethodChannel + CGEvent 回放 + HID 键码映射 |

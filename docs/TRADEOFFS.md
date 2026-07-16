@@ -35,7 +35,7 @@
 
 ## 2. 服务端语言: Node.js
 
-### Decision: ✅ Node.js (with mediasoup)
+### Decision: ✅ Node.js (signaling / control relay)
 
 ### Alternatives Considered:
 
@@ -48,42 +48,48 @@
 
 ### Why Node.js:
 - **发挥既有优势**: 前端背景,对 JavaScript/TypeScript 最熟悉,能把精力集中在架构而非语言学习
-- **mediasoup 官方就是 Node.js 封装**,有完整的 API 和大量 production deployment 案例
-- **生态成熟**: WebSocket (`ws`), JWT (`jsonwebtoken`), 日志 (`pino`) 都是经过验证的选择
-- **快速迭代**: Node.js 的热重载工具 (nodemon) + TypeScript 的 tsc watch 模式,开发体验接近 Flutter hot reload
+- **WebSocket (`ws`) 与 JWT (`jsonwebtoken`) 在 Node 生态里是一等公民**,信令/鉴权几行代码搞定
+- **生态成熟**: 日志 (`pino`)、配置校验 (`zod`) 都是经过验证的选择
+- **快速迭代**: Node.js 的热重载工具 (nodemon),开发体验接近 Flutter hot reload
 
 ### Risks & Mitigations:
 | Risk | Impact | Mitigation |
 |------|--------|-----------|
-| Node.js 单线程瓶颈 | 高并发时 CPU 阻塞 | 用 cluster 模式或多进程(worker_threads),或后续迁移到 Go |
-| mediasoup C++ 模块内存泄漏 | 长时间运行不稳定 | 定期重启 worker (maxOldAgeSize),加 PM2 进程监控 |
+| Node.js 单线程瓶颈 | 高并发时 CPU 阻塞 | 信令/控制消息量极小,单进程足够;必要时 cluster 或多进程 |
+| WS 长连接需保活 | 僵死连接占用资源 | 服务端 30s 心跳 ping/pong,无响应即 terminate |
 
 ---
 
-## 3. 媒体服务器: mediasoup (SFU)
+## 3. 媒体传输: WebRTC P2P（1:1，已放弃 mediasoup SFU）
 
-### Decision: ✅ mediasoup SFU 架构
+### Decision: ✅ 直接 P2P（Controller ↔ Viewer 一对一）
+
+> 历史决策：早期选了 mediasoup SFU，理由是 1:N 广播、simulcast、生产验证。
+> 但在本项目的实际场景（远程**控制**）里，一个房间固定是「1 个控制端 + 1 个观看端」，
+> 并不存在一对多广播需求；而 mediasoup 带来 C++ 原生编译、worker 进程管理、Router CPU 上限等
+> 运维负担，与「快速交付 + 轻量」的初衷相悖。因此已**移除 mediasoup**，媒体改为端到端 P2P，
+> 服务端仅做信令/控制中继（见 `signal-server.js`）。
 
 ### Alternatives Considered:
 
-| 方案 | 放弃理由 |
+| 方案 | 结论 |
 |------|---------|
-| Janus / Jitsi | 功能太重,学习曲线陡峭,投入产出比不高,不值得花这么多时间 |
-| WebRTC-select / Pion (自建) | 要自己实现 simulcast、NACK、RTX 等复杂逻辑,偏离核心目标 |
-| TURN only | 没有媒体路由能力,无法实现多 Viewer 场景 |
-| Mesh (Peer-to-Peer) | Controller 直连每个 Viewer,N² 复杂度,不适合 1:N 广播 |
+| mediasoup / Janus / Jitsi (SFU) | 过重；本场景无 1:N 广播，SFU 的 fan-out/simulcast 用不上，反而引入 C++ 编译与运维成本 |
+| Mesh (P2P 多对多) | 仅 1:1 时退化为单连接，无 N² 复杂度；本场景足够 |
+| TURN only | 仅做 NAT 穿透基础设施；媒体仍由 P2P 直连（必要时经 TURN 中继） |
+| 自建 WebRTC (Pion/aiortc) | 要自己实现 NACK/RTX，偏离核心目标 |
 
-### Why mediasoup:
-- **SFU 架构天然适合 1:N 广播**: Controller 只发一次流,mediasoup fan-out 给所有 Viewer
-- **Simulcast 支持**: 自动根据带宽切换质量层,省去自己实现自适应码率的麻烦
-- **生产验证**: Slack、Zoom 都在用类似架构,稳定性有保障
-- **API 简洁**: `Room.createProducer()` / `Room.createConsumer()` 几行代码搞定核心流程
+### Why P2P (1:1):
+- **场景匹配**: 远程控制是一对一，SFU 的 fan-out 能力完全闲置
+- **零媒体服务器**: 无 C++ 编译、无 worker 管理、无水平扩展压力，部署只需一个轻量 WS 服务
+- **延迟更低**: 媒体不经中转，端到端直连（LAN 下尤佳）
+- **libwebrtc 已内置**: flutter-webrtc 封装好 `RTCPeerConnection`，P2P 是开箱即用的主路径
 
 ### Risks & Mitigations:
 | Risk | Impact | Mitigation |
 |------|--------|-----------|
-| mediasoup 编译依赖 GCC/Clang | 开发环境搭建慢 | 用 `npm rebuild` 预编译包,或 Docker 隔离环境 |
-| 大规模场景需部署多个 Router | 单 Router 有 CPU 上限 | MVP 阶段单机足够,后续加 Kubernetes 水平扩展 |
+| 对称型 NAT 无法直连 | 连接失败 | 配置 TURN (`server/.env`) 兜底中继 |
+| 单房间扩展至多 Viewer | 需回到 SFU | 当前产品定位即 1:1；如需多人围观再评估引入 SFU |
 
 ---
 

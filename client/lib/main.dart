@@ -3,10 +3,12 @@ library;
 
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
+import 'core/logger.dart';
 import 'models/config.dart';
 import 'screens/connect_screen.dart';
 
 void main() {
+  setupLogging();
   runApp(const RemoteDesktopApp());
 }
 

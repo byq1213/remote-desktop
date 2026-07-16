@@ -2,6 +2,9 @@ include: package:flutter_lints/flutter.yaml
 
 linter:
   rules:
+    # All application logging now goes through lib/core/logger.dart.
+    avoid_print: true
     prefer_const_constructors: true
     prefer_const_literals_to_create_immutables: true
-    avoid_print: false
+    # Keep diagnostics actionable; do not fail the build on stylistic nits.
+    omit_local_variable_types: false
