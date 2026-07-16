@@ -1,0 +1,145 @@
+name: Release
+
+# 当你推送形如 v1.0.0 的 tag 时，自动构建并发布到 GitHub Releases
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write   # 用于创建 Release 并上传附件
+
+jobs:
+  # ===================== 构建 Flutter 桌面客户端 =====================
+  build-client:
+    name: Build client (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            platform: macos
+          - os: windows-latest
+            platform: windows
+          - os: ubuntu-latest
+            platform: linux
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Flutter
+        uses: flutter-actions/setup-flutter@v2
+        with:
+          channel: 'stable'
+
+      - name: Enable desktop targets
+        shell: bash
+        run: |
+          flutter config --enable-macos-desktop
+          flutter config --enable-windows-desktop
+          flutter config --enable-linux-desktop
+
+      # Linux 需要额外系统库才能编译 Flutter 桌面端
+      - name: Install Linux dependencies
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-3-dev libblkid-dev liblzma-dev libsecret-1-dev \
+            libjsoncpp-dev libstdc++-12-dev clang cmake ninja-build
+
+      - name: Get dependencies
+        working-directory: client
+        run: flutter pub get
+
+      # ---- macOS ----
+      - name: Build macOS
+        if: matrix.platform == 'macos'
+        working-directory: client
+        run: |
+          flutter build macos --release
+          cd build/macos/Build/Products/Release
+          ditto -c -k --sequesterRsrc --keepParent \
+            remote_desktop.app "$GITHUB_WORKSPACE/remote-desktop-macos.zip"
+
+      # ---- Windows ----
+      - name: Build Windows
+        if: matrix.platform == 'windows'
+        working-directory: client
+        shell: pwsh
+        run: |
+          flutter build windows --release
+          Compress-Archive -Path "build\windows\x64\runner\Release\*" `
+            -DestinationPath "$env:GITHUB_WORKSPACE\remote-desktop-windows.zip"
+
+      # ---- Linux ----
+      - name: Build Linux
+        if: matrix.platform == 'linux'
+        working-directory: client
+        run: |
+          flutter build linux --release
+          cd build/linux/x64/release/bundle
+          tar czf "$GITHUB_WORKSPACE/remote-desktop-linux.tar.gz" .
+
+      - name: Upload client artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: client-${{ matrix.platform }}
+          # 每台机器只产出对应平台的包，其余找不到的忽略即可
+          path: |
+            ${{ github.workspace }}/remote-desktop-macos.zip
+            ${{ github.workspace }}/remote-desktop-windows.zip
+            ${{ github.workspace }}/remote-desktop-linux.tar.gz
+          if-no-files-found: ignore
+
+  # ===================== 打包 Node.js 服务端（纯源码，无需编译） =====================
+  build-server:
+    name: Package server
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Package server source
+        run: |
+          tar czf "$GITHUB_WORKSPACE/remote-desktop-server.tar.gz" \
+            --exclude='server/node_modules' \
+            --exclude='server/.env' \
+            --exclude='server/*.log' \
+            server
+      - uses: actions/upload-artifact@v4
+        with:
+          name: server
+          path: ${{ github.workspace }}/remote-desktop-server.tar.gz
+
+  # ===================== 汇总并发布到 Release =====================
+  release:
+    name: Publish GitHub Release
+    needs: [build-client, build-server]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -lh artifacts
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true
+          body: |
+            ## 下载与使用
+
+            - **macOS**：下载 `remote-desktop-macos.zip`，解压后拖入 `Applications`。
+              未签名应用首次打开会被 Gatekeeper 拦截，右键 → 打开 即可；
+              或在终端执行 `xattr -cr /Applications/remote_desktop.app`。
+            - **Windows**：下载 `remote-desktop-windows.zip`，解压后运行 `remote_desktop.exe`。
+            - **Linux**：下载 `remote-desktop-linux.tar.gz`，解压后运行其中的可执行文件
+              （需系统已安装 GTK3 等运行时）。
+            - **服务端**：下载 `remote-desktop-server.tar.gz`，解压后
+              `cp .env.example .env && npm install && npm start`。
+
+            > 客户端与服务端需配合使用：先启动服务端，再用客户端连接。
