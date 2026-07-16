@@ -10,7 +10,10 @@ permissions:
   contents: write   # 用于创建 Release 并上传附件
 
 jobs:
-  # ===================== 构建 Flutter 桌面客户端 =====================
+  # ===================== 构建 Flutter 桌面客户端（多平台） =====================
+  # 说明：Flutter 桌面端必须在对应系统上编译，所以这里用 matrix 在三台真机
+  # runner 上分别构建 —— GitHub 免费提供 macos/windows/ubuntu 云主机，
+  # CI 替你打全平台，无需自己准备多台机器。
   build-client:
     name: Build client (${{ matrix.platform }})
     strategy:
@@ -38,6 +41,12 @@ jobs:
           flutter config --enable-macos-desktop
           flutter config --enable-windows-desktop
           flutter config --enable-linux-desktop
+
+      # 仓库只提交了 macOS 工程目录；Win/Linux 的工程文件在此动态生成
+      # （flutter config 只是开 SDK 开关，不会创建平台文件夹，必须这一步）
+      - name: Add Windows/Linux desktop project files
+        working-directory: client
+        run: flutter create --platforms=windows,linux .
 
       # Linux 需要额外系统库才能编译 Flutter 桌面端
       - name: Install Linux dependencies
@@ -133,7 +142,8 @@ jobs:
           body: |
             ## 下载与使用
 
-            - **macOS**：下载 `remote-desktop-macos.zip`，解压后拖入 `Applications`。
+            - **macOS**：下载 `remote-desktop-macos.zip`，解压后把 `remote_desktop.app`
+              拖入 `应用程序`。
               未签名应用首次打开会被 Gatekeeper 拦截，右键 → 打开 即可；
               或在终端执行 `xattr -cr /Applications/remote_desktop.app`。
             - **Windows**：下载 `remote-desktop-windows.zip`，解压后运行 `remote_desktop.exe`。
