@@ -47,5 +47,6 @@ docs/*
 !docs/ARCHITECTURE.md
 !docs/TRADEOFFS.md
 !docs/TECHNICAL_NOTES.md
+!docs/screenshots/
 
 logs/

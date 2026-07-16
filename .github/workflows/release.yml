@@ -33,7 +33,9 @@ jobs:
       - name: Setup Flutter
         uses: flutter-actions/setup-flutter@v2
         with:
-          channel: 'stable'
+          # 固定版本，与本地生成 client/{linux,windows} 工程目录的 Flutter 保持一致，
+          # 避免 runner 缓存的旧版 stable（如 3.32.0）模板不兼容。
+          flutter-version: '3.41.6'
 
       - name: Enable desktop targets
         shell: bash
@@ -42,11 +44,10 @@ jobs:
           flutter config --enable-windows-desktop
           flutter config --enable-linux-desktop
 
-      # 仓库只提交了 macOS 工程目录；Win/Linux 的工程文件在此动态生成
-      # （flutter config 只是开 SDK 开关，不会创建平台文件夹，必须这一步）
-      - name: Add Windows/Linux desktop project files
-        working-directory: client
-        run: flutter create --platforms=windows,linux .
+      # Windows/Linux 的工程目录（client/windows、client/linux）已随仓库提交，
+      # 不再依赖 CI 运行时 `flutter create` 动态生成。原因：旧版 Flutter（如 3.32.0）
+      # 对“已存在的项目”执行 `flutter create --platforms=...` 不会真正新增平台目录，
+      # 会导致后续 build 报 “No ... desktop project configured”。
 
       # Linux 需要额外系统库才能编译 Flutter 桌面端
       - name: Install Linux dependencies
