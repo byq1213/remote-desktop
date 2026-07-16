@@ -22,11 +22,22 @@
 
 library;
 
+import 'dart:math';
+
 import 'package:flutter_webrtc/flutter_webrtc.dart';
+import 'package:screen_retriever/screen_retriever.dart';
 
 class ScreenCaptureManager {
   MediaStream? _screenStream;
   bool _isCapturing = false;
+
+  /// Real captured frame size, read from the track settings right after
+  /// `getDisplayMedia` returns. On macOS the capturer routinely IGNORES the
+  /// requested `width`/`height`, so this — not the requested size — is the
+  /// source of truth for the actual (possibly non-64-aligned) frame the
+  /// encoder and the local preview have to deal with.
+  (int, int)? _realCapturedSize;
+  (int, int)? get capturedSize => _realCapturedSize;
 
   bool get isCapturing => _isCapturing;
 
@@ -67,6 +78,22 @@ class ScreenCaptureManager {
   /// Passing a [sourceId] selects exactly one display (the macOS native layer
   /// reads `video.deviceId.exact`). With no [sourceId] we auto-pick the first
   /// enumerated screen to avoid the merged-virtual-desktop capture.
+  ///
+  /// ## HiDPI / Retina stride fix
+  /// A macOS screen capture returns frames whose `bytesPerRow` (row stride) is
+  /// aligned to a 256-byte boundary. When `width × 4` is NOT a multiple of 256
+  /// (e.g. a Retina built-in at 3024 → 12096, /256 = 47.25), the capture's
+  /// tight row copy and the renderer disagree on stride and the image comes out
+  /// sheared / "歪歪扭扭" — and it shows up in the *local preview too*, because
+  /// the preview renders the raw captured frame, not the (post-encode) stream.
+  /// A standard DPR-1 external 1080p screen (1920×4 = 7680, exactly ÷256) has
+  /// no padding, hence it looks fine. The fix: request an **exact** capture
+  /// size whose width is a multiple of 64 (so `width × 4` is a multiple of 256)
+  /// and whose height is even. Unlike the `max` constraint (which the macOS
+  /// native layer ignores), an *exact* `width`/`height` is honored and the
+  /// captured buffer stays tightly packed → no shear, on both preview and the
+  /// transmitted stream. The size is derived per-display from its physical
+  /// resolution ÷ DPR, so Retina and external screens are handled dynamically.
   Future<MediaStream> _startDisplayCapture({
     int maxWidth = 1920,
     int maxHeight = 1080,
@@ -89,20 +116,34 @@ class ScreenCaptureManager {
       }
     }
 
-    // NOTE: on macOS desktop capture the native layer ignores width/height
-    // `max` constraints and captures the source at native resolution; the
-    // encode-side downscale (see PeerManager._capOutgoingResolution) bounds
-    // the resolution the viewer receives.
+    // Resolve the chosen display's physical size + DPR so we can compute a
+    // 64-aligned capture size (dynamic per-screen compatibility).
+    Display? display;
+    if (resolvedSourceId != null) {
+      display = await _matchDisplay(resolvedSourceId);
+    }
+    final size = display != null
+        ? _resolveCaptureSize(display, max(maxWidth, maxHeight).toDouble())
+        : null;
+    // macOS `getDisplayMedia` ROUTINELY IGNORES width/height for screen capture
+    // and falls back to the display's native resolution. A native frame whose
+    // width is not a multiple of 64 makes `width × 4` != the 256-byte row
+    // stride, shearing the frame (see TECHNICAL_NOTES #13.4). The capturer may
+    // only honour an UN-wrapped integer width (not {ideal/max/exact}), so we
+    // pass a bare 64-aligned value on the long side and leave height free to
+    // preserve aspect. If this is still ignored, the shear is baked into the
+    // captured buffer and cannot be fixed from Dart (see diagnosis in chat).
+    final capW = size?.$1 ?? 1920;
+
+    final video = <String, dynamic>{
+      'frameRate': fps,
+      if (resolvedSourceId != null) 'deviceId': {'exact': resolvedSourceId},
+      'width': capW,
+    };
+
     final constraints = <String, dynamic>{
       'audio': false,
-      'video': resolvedSourceId != null
-          ? {
-              'deviceId': {'exact': resolvedSourceId},
-              'mandatory': {'frameRate': fps},
-            }
-          : {
-              'frameRate': fps,
-            },
+      'video': video,
     };
 
     try {
@@ -112,11 +153,74 @@ class ScreenCaptureManager {
       print('ScreenCapture: getDisplayMedia failed: $e');
       rethrow;
     }
+    // Read the ACTUAL captured dimensions. The capturer may have ignored the
+    // requested size, so this is what we must feed the encoder and the preview.
+    try {
+      final vt = _screenStream!.getVideoTracks().first;
+      final s = vt.getSettings();
+      final w = s['width'] as int?;
+      final h = s['height'] as int?;
+      if (w != null && h != null) {
+        _realCapturedSize = (w, h);
+        final aligned = (w % 64 == 0);
+        print('ScreenCapture: REAL captured size = ${w}x$h '
+            '(width ${aligned ? "IS" : "is NOT"} 64-aligned'
+            '${aligned ? "" : " -> local preview may shear"}))');
+      }
+    } catch (e) {
+      print('ScreenCapture: could not read track settings ($e)');
+    }
     final suffix = resolvedSourceId != null
         ? ' (source=$resolvedSourceId)'
         : ' (default screen)';
-    print('ScreenCapture: screen capture started$suffix');
+    final sizeNote = size != null ? ' captureSize=${size.$1}x${size.$2}' : '';
+    print('ScreenCapture: screen capture started$suffix$sizeNote');
     return _screenStream!;
+  }
+
+  /// Map a flutter_webrtc screen [sourceId] to a [ScreenRetriever] display so we
+  /// can read its physical size + DPI. Ids may use different formats between the
+  /// two packages, so on a miss we return null and the caller falls back to a
+  /// width-only (aspect-preserving) capture constraint.
+  Future<Display?> _matchDisplay(String sourceId) async {
+    try {
+      final displays = await ScreenRetriever.instance.getAllDisplays();
+      for (final d in displays) {
+        if (d.id == sourceId) return d;
+      }
+      return null;
+    } catch (e) {
+      print('ScreenCapture: display lookup failed ($e)');
+      return null;
+    }
+  }
+
+  /// Compute a stride-safe, DPI-aware capture size for [display].
+  ///
+  /// Returns `(width, height)` where `width` (the long side when landscape) is
+  /// snapped DOWN to a multiple of 64 so `width × 4` is a multiple of 256 (no
+  /// row-stride padding → no shear), and the other side is even. The long side
+  /// is capped at [maxLongSide] so we never upscale a small display.
+  (int, int)? _resolveCaptureSize(Display display, double maxLongSide) {
+    final dpr = (display.scaleFactor ?? 1.0).toDouble();
+    final physW = (display.size.width.toDouble() * dpr).round();
+    final physH = (display.size.height.toDouble() * dpr).round();
+    if (physW <= 0 || physH <= 0) return null;
+    final landscape = physW >= physH;
+    final long = (landscape ? physW : physH).toDouble();
+    final short = (landscape ? physH : physW).toDouble();
+    const block = 64;
+    // The LONG side must be 64-aligned so `width × 4` is a multiple of 256
+    // (row-stride safe → no shear). The SHORT side only needs to be EVEN for
+    // chroma sampling, so we snap it to the nearest even number rather than to
+    // 64 — otherwise ordinary heights (1080 etc.) get crushed. The long side is
+    // capped at [maxLongSide] so we never upscale a small display.
+    var targetLong = ((min(maxLongSide, long) ~/ block) * block).toInt();
+    if (targetLong < block) targetLong = block;
+    var targetShort = (short * targetLong / long).round();
+    if (targetShort.isOdd) targetShort += 1;
+    if (targetShort < 2) targetShort = 2;
+    return landscape ? (targetLong, targetShort) : (targetShort, targetLong);
   }
 
   /// Stop capture.

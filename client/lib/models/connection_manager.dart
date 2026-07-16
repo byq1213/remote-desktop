@@ -33,6 +33,11 @@ enum ConnectionState {
 }
 
 class ConnectionManager {
+  /// Target max long-side (px) of the shared screen video. Mirrors
+  /// [PeerManager.kDefaultTargetLongSide] so it can be tuned once via
+  /// --dart-define=TARGET_LONG_SIDE=<px> at build time.
+  static const int targetLongSide = PeerManager.kDefaultTargetLongSide;
+
   final Room room;
   final String serverBaseUrl; // e.g. http://localhost:3000
   final String token;          // pre-obtained JWT
@@ -65,11 +70,32 @@ class ConnectionManager {
   /// normalized viewer coordinates back to screen pixels.
   Size _localScreenSize = const Size(1920, 1080);
 
+  /// Device-pixel-ratio of the primary display (logical × dpr = physical).
+  double _localScreenScaleFactor = 1.0;
+
   /// Ensures clean-up runs only once (disconnect() may be followed by dispose()).
   bool _cleanedUp = false;
 
-  /// Local (controller) screen-capture stream, for preview.
-  MediaStream? get localStream => _peer.localStream;
+  /// Local (controller) stream for preview. Prefers the stride-safe loopback
+  /// stream (see PeerManager.startLocalPreviewLoopback) so the renderer never
+  /// shows the raw, non-64-aligned capture frame.
+  MediaStream? get localStream => _peer.localPreviewStream ?? _peer.localStream;
+
+  /// Real captured frame size (may differ from the requested size because
+  /// macOS getDisplayMedia ignores width/height). Exposed so the UI can
+  /// re-apply the outgoing scale from the true source size.
+  ///
+  /// `track.getSettings()` returns `0x0` on macOS screen capture, so when that
+  /// is unusable we derive the native physical capture size from the primary
+  /// display the controller shares (logical size × device-pixel-ratio).
+  (int, int)? get capturedSize {
+    final cs = _screenCapture?.capturedSize;
+    if (cs != null && cs.$1 > 0 && cs.$2 > 0) return cs;
+    final w = (_localScreenSize.width * _localScreenScaleFactor).round();
+    final h = (_localScreenSize.height * _localScreenScaleFactor).round();
+    if (w > 0 && h > 0) return (w, h);
+    return null;
+  }
 
   /// Called when the remote stream becomes available (viewer side).
   Function(MediaStream)? onRemoteStreamUpdated;
@@ -84,9 +110,36 @@ class ConnectionManager {
   /// The UI calls this after the local preview paints its first frame so the
   /// encoder downscales the chosen display's actual resolution (dynamic
   /// resolution) rather than an estimate.
-  void rescaleOutgoing({int? width, int? height, double maxLongSide = 3840}) {
+  ///
+  /// [dpr] is the source display's device-pixel-ratio. If omitted we estimate
+  /// it from the captured physical size vs. the logical primary-screen size we
+  /// read in [_fetchLocalScreenSize] — this is what lets a Retina (HiDPI)
+  /// screen be scaled to its natural logical resolution instead of shearing.
+  void rescaleOutgoing(
+      {int? width,
+      int? height,
+      double? maxLongSide,
+      double? dpr}) {
+    maxLongSide ??= targetLongSide.toDouble();
+    dpr ??= _estimateDpr(width, height);
     _peer.rescaleOutgoing(
-        width: width, height: height, maxLongSide: maxLongSide);
+        width: width, height: height, maxLongSide: maxLongSide, dpr: dpr);
+  }
+
+  /// Estimate the device-pixel-ratio of the shared screen: compare its captured
+  /// *physical* long side against the *logical* primary-display long side.
+  /// Retina screens report a physical size ≈ dpr× the logical size; standard
+  /// external screens report ≈ 1×. Clamped to a sane [1.0, 3.0] range.
+  double _estimateDpr(int? w, int? h) {
+    if (w == null || h == null) return 1.0;
+    final logicalLong = _localScreenSize.width >= _localScreenSize.height
+        ? _localScreenSize.width
+        : _localScreenSize.height;
+    final physicalLong = (w > h ? w : h).toDouble();
+    if (logicalLong <= 0) return 1.0;
+    final ratio = physicalLong / logicalLong;
+    if (ratio >= 1.5) return ratio > 3.0 ? 3.0 : ratio;
+    return 1.0;
   }
 
   /// Build a clean WebSocket URL from a base HTTP(S) URL, stripping any
@@ -126,6 +179,10 @@ class ConnectionManager {
   /// to the PeerConnection. Offers must only be created after this is true,
   /// otherwise the SDP would contain no media tracks.
   bool _screenCaptureReady = false;
+  bool _loopbackStarted = false;
+  bool _realSizeApplied = false;
+  int _realAppliedW = 0;
+  int _realAppliedH = 0;
 
   void addStateListener(Function(ConnectionState) listener) {
     _stateListeners.add(listener);
@@ -148,8 +205,10 @@ class ConnectionManager {
     try {
       final display = await ScreenRetriever.instance.getPrimaryDisplay();
       _localScreenSize = Size(display.size.width, display.size.height);
+      _localScreenScaleFactor = display.scaleFactor?.toDouble() ?? 1.0;
       print('Controller: local screen size = '
-          '${_localScreenSize.width}x${_localScreenSize.height}');
+          '${_localScreenSize.width}x${_localScreenSize.height} '
+          '@${_localScreenScaleFactor}x');
     } catch (e) {
       print('Controller: failed to read screen size ($e), '
           'falling back to $_localScreenSize');
@@ -208,14 +267,45 @@ class ConnectionManager {
   void _setupController() {
     _screenCapture = ScreenCaptureManager();
     _screenCapture!
-        .startCapture(fps: 30, sourceId: screenSourceId)
+        .startCapture(
+          fps: 30,
+          sourceId: screenSourceId,
+          // Let non-macOS captures request up to the target long side so the
+          // encoder (below) isn't starved by a low capture cap. macOS ignores
+          // this anyway and returns the full native resolution.
+          maxWidth: targetLongSide,
+          maxHeight: targetLongSide,
+        )
         .then((stream) async {
       _peer.localStream = stream;
       onLocalStreamUpdated?.call(stream);
       // Add every track (the screen video) to the PeerConnection BEFORE
       // any offer is created, otherwise the SDP would have no media.
-      await _peer.addTracks(stream);
-      print('Controller: ${stream.getTracks().length} local track(s) added');
+      // Pass the best-known capture size so addTracks applies the CORRECT
+      // 64-aligned encoder scale immediately — on macOS a later
+      // setParameters(scaleResolutionDownBy) often does NOT re-apply, so the
+      // scale chosen here is what the viewer actually receives.
+      final real = capturedSize;
+      if (real != null && real.$1 > 0 && real.$2 > 0) {
+        await _peer.addTracks(stream,
+            width: real.$1, height: real.$2);
+        print('Controller: ${stream.getTracks().length} local track(s) added '
+            '(initial scale from derived capture size ${real.$1}x${real.$2})');
+      } else {
+        await _peer.addTracks(stream);
+        print('Controller: ${stream.getTracks().length} local track(s) added '
+            '(no derived size — sending native)');
+      }
+      // Re-apply from the derived size as a belt-and-braces backup. The
+      // *true* capture size is only known once the raw renderer paints its
+      // first frame (getSettings() returns 0x0 and the display DPR is
+      // unreliable on macOS), so the authoritative rescale + stride-safe
+      // loopback preview is triggered from there (see applyRealCaptureSize).
+      if (real != null && real.$1 > 0 && real.$2 > 0) {
+        rescaleOutgoing(width: real.$1, height: real.$2);
+        print('Controller: backup outgoing rescale from derived '
+            'capture size ${real.$1}x${real.$2}');
+      }
       _screenCaptureReady = true;
       _maybeCreateOffer();
     }).catchError((e) {
@@ -223,6 +313,47 @@ class ConnectionManager {
       onCaptureError?.call(
           'Screen capture failed: grant Screen Recording permission (macOS) or run a build signed with that entitlement.');
     });
+  }
+
+  /// Called once the raw preview renderer paints its first frame, which is the
+  /// only reliable source of the *true* capture size on macOS (track
+  /// getSettings() returns 0x0 and the display DPR is unreliable). Re-applies
+  /// the 64-aligned encoder scale from the real dimensions and, if not already
+  /// done, starts the stride-safe local-preview loopback.
+  void applyRealCaptureSize(int w, int h) {
+    if (w <= 0 || h <= 0) return;
+    // Guard: this is only ever authorized from the RAW capture's first frame
+    // (the true source size, e.g. 2940x1912). The stride-safe loopback preview
+    // rebinds the same renderer to its own decoded stream (e.g. 1280x832), and
+    // *that* stream also fires onFirstFrameRendered — re-entering this method.
+    // If we let it apply again from the decoded size, _scaleFor(1280, 832) is
+    // already 64-aligned & ≤ budget, so it returns scale=1.0 and the MAIN
+    // PeerConnection would then ship the raw, sheared 2940x1912 to the viewer.
+    // Run exactly once from the raw frame and ignore all later (loopback) frames.
+    if (_realSizeApplied) {
+      print('Controller: real capture size already applied '
+          '(${_realAppliedW}x${_realAppliedH}); ignoring ${w}x$h '
+          'from loopback preview frame');
+      return;
+    }
+    _realSizeApplied = true;
+    _realAppliedW = w;
+    _realAppliedH = h;
+    rescaleOutgoing(width: w, height: h);
+    print('Controller: real capture size from first frame = ${w}x$h '
+        '— re-applied 64-aligned outgoing scale');
+    _startLoopback(w, h);
+  }
+
+  Future<void> _startLoopback(int w, int h) async {
+    if (_loopbackStarted) return;
+    _loopbackStarted = true;
+    final stream = _peer.localStream;
+    if (stream == null) return;
+    print('Controller: starting stride-safe local preview loopback '
+        'from ${w}x$h');
+    final preview = await _peer.startLocalPreviewLoopback(stream, w, h);
+    onLocalStreamUpdated?.call(preview ?? stream);
   }
 
   // ========== Viewer Side ==========

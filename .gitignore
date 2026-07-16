@@ -46,6 +46,6 @@ docs/*
 !docs/SETUP.md
 !docs/ARCHITECTURE.md
 !docs/TRADEOFFS.md
-!docs/BUGFIX_WEBRTC_SCREENSHARE.md
+!docs/TECHNICAL_NOTES.md
 
 logs/

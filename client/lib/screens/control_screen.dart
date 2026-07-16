@@ -198,13 +198,16 @@ class _ControlScreenState extends State<ControlScreen> {
             'videoSize=${_localRenderer.videoWidth}x${_localRenderer.videoHeight}');
         if (mounted && !_leaving) {
           _localFirstFrame = true;
-          // Re-apply the outgoing resolution cap from the REAL captured size
-          // (dynamic resolution) so the chosen display is shared at its true
-          // dimensions rather than the pre-frame estimate.
-          _connectionManager.rescaleOutgoing(
-            width: _localRenderer.videoWidth,
-            height: _localRenderer.videoHeight,
-          );
+          // The raw renderer's first frame reports the TRUE capture size
+          // (e.g. 2940x1912). On macOS getSettings() returns 0x0 and the
+          // display DPR is unreliable, so this is the only trustworthy size.
+          // Drive the 64-aligned encoder scale AND the stride-safe loopback
+          // preview from it.
+          final rw = _localRenderer.videoWidth;
+          final rh = _localRenderer.videoHeight;
+          if (rw > 0 && rh > 0) {
+            _connectionManager.applyRealCaptureSize(rw, rh);
+          }
           setState(() {}); // re-layout to the real aspect ratio
         }
       };
