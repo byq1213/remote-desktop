@@ -42,8 +42,8 @@ See `docs/SETUP.md` for detailed environment setup instructions.
 
 **Viewer 端（远程操控中）**
 
-![可远程操作 1](docs/screenshot/可远程操作1.png)
-![可远程操作 2](docs/screenshot/可远程操作2.png)
+![可远程操作 1](docs/screenshots/可远程操作1.png)
+![可远程操作 2](docs/screenshots/可远程操作2.png)
 
 ## Documentation
 

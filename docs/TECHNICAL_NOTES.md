@@ -102,9 +102,9 @@ URL 被破坏（`ws://` 被改成 `http://`、结尾被追加 `#` 片段），�
 
 **症状配图：**
 - 分辨率被压低（画面发虚、细节丢失）：
-  ![分辨率太低问题](./screenshot/分辨率太低问题.png)
+  ![分辨率太低问题](./screenshots/分辨率太低问题.png)
 - Controller 端画面被拉伸/扭曲（比例失真）：
-  ![controller 端扭曲的分辨率](./screenshot/controller端扭曲的分辨率.png)
+  ![controller 端扭曲的分辨率](./screenshots/controller端扭曲的分辨率.png)
 
 ---
 
