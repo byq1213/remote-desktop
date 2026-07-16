@@ -103,6 +103,13 @@ class ConnectionManager {
   /// Called when the local screen-capture stream is ready (controller side).
   Function(MediaStream)? onLocalStreamUpdated;
 
+  /// Called once the stride-safe local-preview loopback has produced its
+  /// decoded (64-aligned) stream. The UI uses this to stop hiding the raw
+  /// capture behind a placeholder — the raw frame is non-64-aligned and would
+  /// render sheared, so we only reveal the surface once this clean stream is
+  /// bound.
+  Function(MediaStream)? onLocalPreviewReady;
+
   /// Called when screen capture fails to start (e.g. permission denied).
   Function(String)? onCaptureError;
 
@@ -350,10 +357,19 @@ class ConnectionManager {
     _loopbackStarted = true;
     final stream = _peer.localStream;
     if (stream == null) return;
+    // Use the SAME budget + DPR as the main outgoing stream so the preview
+    // resolution matches what the viewer receives, and so the loopback scaler
+    // snaps to a 64-aligned width / even height (stride-safe decode).
+    final dpr = _estimateDpr(w, h);
     print('Controller: starting stride-safe local preview loopback '
-        'from ${w}x$h');
-    final preview = await _peer.startLocalPreviewLoopback(stream, w, h);
+        'from ${w}x$h (budget=${targetLongSide}, dpr=${dpr.toStringAsFixed(2)})');
+    final preview = await _peer.startLocalPreviewLoopback(stream, w, h,
+        maxLongSide: targetLongSide.toDouble(), dpr: dpr);
+    // Reveal the surface only once we have the clean, decoded stream. If the
+    // loopback failed we still reveal (falling back to the raw capture) so the
+    // placeholder doesn't hang forever.
     onLocalStreamUpdated?.call(preview ?? stream);
+    onLocalPreviewReady?.call(preview ?? stream);
   }
 
   // ========== Viewer Side ==========

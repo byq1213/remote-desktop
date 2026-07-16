@@ -21,6 +21,9 @@ class MainFlutterWindow: NSWindow {
       RemoteInput.handle(call: call, result: result)
     }
 
+    // Native ScreenCaptureKit bridge (stride-safe screen capture, Plan C).
+    ScreenCaptureKitManager.register(with: flutterViewController.engine.binaryMessenger)
+
     super.awakeFromNib()
   }
 }

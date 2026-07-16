@@ -51,7 +51,9 @@ class _ControlScreenState extends State<ControlScreen> {
   bool _controlEnabled = true; // viewer → controller remote input on/off
   int _lastButton = 0;         // last pressed mouse button (for up events)
   Size _remoteBoxSize = const Size(640, 360); // actual on-screen remote video box
-  bool _localFirstFrame = false;  // controller local preview painted a frame
+  bool _localFirstFrame = false;  // controller raw capture painted a frame
+  bool _localPreviewReady = false; // stride-safe loopback preview is bound
+  String? _lastLocalStreamId;      // for diagnosing renderer srcObject swap
   bool _remoteFirstFrame = false; // viewer received & painted a remote frame
   bool _isRemoteMuted = false;    // remote video track reported muted
   final FocusNode _inputFocus = FocusNode();
@@ -71,6 +73,12 @@ class _ControlScreenState extends State<ControlScreen> {
     _connectionManager.addStateListener(_onConnectionStateChange);
     _connectionManager.onRemoteStreamUpdated = _wireRemoteVideo;
     _connectionManager.onLocalStreamUpdated = _wireLocalVideo;
+    _connectionManager.onLocalPreviewReady = (stream) {
+      if (mounted && !_leaving) {
+        _localPreviewReady = true;
+        setState(() {});
+      }
+    };
     _connectionManager.onCaptureError = (msg) => setState(() => _statusMessage = msg);
     _connect();
   }
@@ -179,10 +187,13 @@ class _ControlScreenState extends State<ControlScreen> {
     final s = stream ?? _connectionManager.localStream;
     if (s != null && _localRenderer.srcObject != s) {
       final tracks = s.getTracks();
+      final swapped = s.id != _lastLocalStreamId;
       print('Controller: wiring local video — stream=${s.id}, '
           'tracks=${tracks.length}, '
           'rendererInitialized=${_localRenderer.textureId != null}, '
-          'videoSize=${_localRenderer.videoWidth}x${_localRenderer.videoHeight}');
+          'videoSize=${_localRenderer.videoWidth}x${_localRenderer.videoHeight}'
+          '${_lastLocalStreamId != null ? ' (renderer swap=${swapped ? "YES" : "NO!"})' : ""}');
+      _lastLocalStreamId = s.id;
       for (final t in tracks) {
         print('  track: kind=${t.kind}, enabled=${t.enabled}, muted=${t.muted}');
       }
@@ -393,7 +404,7 @@ class _ControlScreenState extends State<ControlScreen> {
         Expanded(child: LayoutBuilder(builder: (context, constraints) {
           return Center(child: _fitVideoBox(
             _localRenderer, constraints.maxWidth, constraints.maxHeight,
-            firstFrame: _localFirstFrame));
+            firstFrame: _localPreviewReady));
         })),
         const SizedBox(height: 16),
         ElevatedButton.icon(

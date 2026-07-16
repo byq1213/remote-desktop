@@ -236,25 +236,62 @@ class PeerManager {
       recv.onTrack = (RTCTrackEvent e) {
         if (e.streams.isNotEmpty && !got.isCompleted) {
           _localPreviewStream = e.streams.first;
+          print('PeerManager: loopback preview stream id='
+              '${_localPreviewStream!.id} (must differ from raw capture id)');
           got.complete(_localPreviewStream!);
         }
       };
-      send.onIceCandidate = (c) => recv!.addCandidate(c);
-      recv.onIceCandidate = (c) => send!.addCandidate(c);
+      // NOTE: deliberately NO trickle ICE here. Exchanging candidates via
+      // onIceCandidate risks feeding them to the peer before its remote
+      // description is set, which silently drops them; ICE then never
+      // connects and the loopback times out — leaving the raw (sheared)
+      // capture on screen (the "1470x956 twisted, 1280x832 fine" symptom,
+      // because the 64-aligned size needs no loopback at all). Instead we
+      // wait for gathering to complete and embed the candidates in the SDP
+      // (non-trickle) so both sides learn them *after* setRemoteDescription.
+      // Use a FRESH stream with a unique id for the loopback send. The decoded
+      // preview stream will then carry a DIFFERENT id than the raw capture
+      // stream — essential because RTCVideoRenderer keys srcObject swaps on the
+      // stream id. Reusing the raw id makes it skip the swap and keep showing
+      // the original (sheared) frame; a unique id forces a real re-bind to the
+      // stride-safe 1408x916 (or similar) preview.
       for (final t in source.getTracks()) {
-        await send.addTrack(t, source);
+        final loopSrc = await createLocalMediaStream(
+            'loopback-src-${DateTime.now().microsecondsSinceEpoch}');
+        await send.addTrack(t, loopSrc);
       }
       // Scale the loopback sender to a 64-aligned size from the real capture.
       final lbSenders = await send.getSenders();
       _rescaleSenders(lbSenders,
           width: w, height: h, maxLongSide: maxLongSide, dpr: dpr);
+      // IMPORTANT: prefer VP8 for the loopback too. The *main* PeerConnection
+      // reorders m=video to put VP8 first (see createOffer/createAnswer) to
+      // avoid macOS's flaky H.264 VideoToolbox screencast path. If we DON'T do
+      // the same here, the loopback re-encodes the (non-64-aligned) capture
+      // through H.264 and the decoded preview comes out sheared again. VP8
+      // keeps the loopback preview stride-safe on every size.
       final offer = await send.createOffer();
-      await send.setLocalDescription(offer);
-      await recv.setRemoteDescription(offer);
+      final offerSdp0 = _preferCodec(offer.sdp ?? '', 'VP8') ?? offer.sdp ?? '';
+      await send.setLocalDescription(
+          RTCSessionDescription(offerSdp0, offer.type)); // VP8 + start gather
+      await _waitForIceGathering(send);
+      // Local description now carries VP8 ordering AND embedded candidates.
+      final offerFinal =
+          (await send.getLocalDescription())?.sdp ?? offerSdp0;
+      await recv.setRemoteDescription(
+          RTCSessionDescription(offerFinal, offer.type));
+
       final answer = await recv.createAnswer();
-      await recv.setLocalDescription(answer);
-      await send.setRemoteDescription(answer);
-      final stream = await got.future.timeout(const Duration(seconds: 5));
+      final answerSdp0 =
+          _preferCodec(answer.sdp ?? '', 'VP8') ?? answer.sdp ?? '';
+      await recv.setLocalDescription(
+          RTCSessionDescription(answerSdp0, answer.type)); // VP8 + start gather
+      await _waitForIceGathering(recv);
+      final answerFinal =
+          (await recv.getLocalDescription())?.sdp ?? answerSdp0;
+      await send.setRemoteDescription(
+          RTCSessionDescription(answerFinal, answer.type));
+      final stream = await got.future.timeout(const Duration(seconds: 15));
       _lbSend = send;
       _lbRecv = recv;
       print('PeerManager: local preview loopback ready (${stream.id})');
@@ -265,6 +302,32 @@ class PeerManager {
       recv?.close();
       return null;
     }
+  }
+
+  /// Wait until ICE gathering completes so candidates are embedded in the
+  /// local description (non-trickle exchange). Guards against an already-
+  /// complete state and against gathering that never reports completion.
+  Future<void> _waitForIceGathering(RTCPeerConnection pc) {
+    final completer = Completer<void>();
+    var done = false;
+    void finish() {
+      if (!done) {
+        done = true;
+        completer.complete();
+      }
+    }
+
+    // Already complete before we subscribed? Don't wait.
+    if (pc.iceGatheringState == RTCIceGatheringState.RTCIceGatheringStateComplete) {
+      finish();
+      return completer.future;
+    }
+    pc.onIceGatheringState = (RTCIceGatheringState state) {
+      if (state == RTCIceGatheringState.RTCIceGatheringStateComplete) finish();
+    };
+    // Safety net: never block the loopback handshake if the callback never
+    // fires (e.g. gathering already complete before we subscribed).
+    return completer.future.timeout(const Duration(seconds: 8), onTimeout: finish);
   }
 
   void _rescaleSenders(List<RTCRtpSender> senders,
