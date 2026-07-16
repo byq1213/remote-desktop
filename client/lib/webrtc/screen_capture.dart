@@ -11,6 +11,14 @@
 /// Apple Developer account is needed for that restricted entitlement). If the
 /// capability is unavailable, the call throws and the caller surfaces a clear
 /// error instead of silently falling back to the camera.
+///
+/// IMPORTANT (extended / multiple displays):
+/// The macOS native implementation captures the *entire virtual desktop*
+/// (every display stitched together) when no `sourceId` is supplied. With an
+/// external display attached that yields a huge, odd frame (e.g. 3840x4072),
+/// which fails to render on the viewer (blue/blank). We therefore enumerate
+/// the available screens and capture a SINGLE display by default, and let the
+/// caller pass an explicit `sourceId` when the user wants a specific screen.
 
 library;
 
@@ -22,56 +30,92 @@ class ScreenCaptureManager {
 
   bool get isCapturing => _isCapturing;
 
+  /// List the screens available for sharing. Use this to build a picker UI so
+  /// the user can choose which display to share (essential with an extended
+  /// display attached). Returns `DesktopCapturerSource` with `id` (pass to
+  /// [startCapture]) and `name` (e.g. "Screen 1").
+  Future<List<DesktopCapturerSource>> listScreens() async {
+    return desktopCapturer.getSources(types: [SourceType.Screen]);
+  }
+
   /// Start screen capture (desktop mode).
   ///
-  /// Uses `getDisplayMedia` so the OS picker appears and only the
-  /// screen-recording permission is requested.
+  /// Uses `getDisplayMedia`. If [sourceId] is omitted we enumerate the screens
+  /// and capture the first one (usually the primary display) so we never fall
+  /// back to the merged virtual-desktop capture that breaks the viewer.
   Future<MediaStream> startCapture({
     int maxWidth = 1920,
     int maxHeight = 1080,
     int fps = 30,
+    String? sourceId,
   }) async {
     if (_isCapturing) {
       throw StateError('Screen capture already in progress');
     }
     _screenStream = await _startDisplayCapture(
+      fps: fps,
+      sourceId: sourceId,
       maxWidth: maxWidth,
       maxHeight: maxHeight,
-      fps: fps,
     );
     _isCapturing = true;
     return _screenStream!;
   }
 
-  /// Capture the display/screen via `getDisplayMedia`.
+  /// Capture a single display/screen via `getDisplayMedia`.
   ///
-  /// This triggers the platform screen picker and the screen-recording
-  /// permission prompt — never the camera.
+  /// Passing a [sourceId] selects exactly one display (the macOS native layer
+  /// reads `video.deviceId.exact`). With no [sourceId] we auto-pick the first
+  /// enumerated screen to avoid the merged-virtual-desktop capture.
   Future<MediaStream> _startDisplayCapture({
     int maxWidth = 1920,
     int maxHeight = 1080,
     int fps = 30,
+    String? sourceId,
   }) async {
-    // Cap the *longer* side only, so the source's aspect ratio is preserved
-    // for both landscape and portrait (e.g. vertical external) displays.
-    // Capping width AND height independently would squash a portrait source
-    // into a 16:9 box and distort it.
-    final cap = maxWidth > maxHeight ? maxWidth : maxHeight;
-    final constraints = {
+    String? resolvedSourceId = sourceId;
+    if (resolvedSourceId == null) {
+      try {
+        final sources =
+            await desktopCapturer.getSources(types: [SourceType.Screen]);
+        if (sources.isNotEmpty) {
+          resolvedSourceId = sources.first.id;
+          print('ScreenCapture: auto-selected screen "${sources.first.name}" '
+              '(id=$resolvedSourceId); ${sources.length} screen(s): '
+              '${sources.map((s) => s.name).join(', ')}');
+        }
+      } catch (e) {
+        print('ScreenCapture: enumerate screens failed, using default: $e');
+      }
+    }
+
+    // NOTE: on macOS desktop capture the native layer ignores width/height
+    // `max` constraints and captures the source at native resolution; the
+    // encode-side downscale (see PeerManager._capOutgoingResolution) bounds
+    // the resolution the viewer receives.
+    final constraints = <String, dynamic>{
       'audio': false,
-      'video': {
-        'frameRate': fps,
-        'width': {'max': cap},
-        'height': {'max': cap},
-      },
+      'video': resolvedSourceId != null
+          ? {
+              'deviceId': {'exact': resolvedSourceId},
+              'mandatory': {'frameRate': fps},
+            }
+          : {
+              'frameRate': fps,
+            },
     };
+
     try {
-      _screenStream = await navigator.mediaDevices.getDisplayMedia(constraints);
+      _screenStream =
+          await navigator.mediaDevices.getDisplayMedia(constraints);
     } catch (e) {
       print('ScreenCapture: getDisplayMedia failed: $e');
       rethrow;
     }
-    print('ScreenCapture: screen capture started via getDisplayMedia');
+    final suffix = resolvedSourceId != null
+        ? ' (source=$resolvedSourceId)'
+        : ' (default screen)';
+    print('ScreenCapture: screen capture started$suffix');
     return _screenStream!;
   }
 

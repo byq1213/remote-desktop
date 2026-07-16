@@ -3,10 +3,14 @@ library;
 
 import 'dart:async';
 import 'package:flutter/material.dart' hide ConnectionState;
+import 'package:flutter/services.dart' show KeyDownEvent, KeyEvent, KeyUpEvent;
+import 'package:flutter/gestures.dart' show PointerScrollEvent;
 import 'package:flutter_webrtc/flutter_webrtc.dart';
+import 'package:window_manager/window_manager.dart';
 
 import '../models/connection_manager.dart';
 import '../models/room.dart';
+import 'connect_screen.dart';
 
 class ControlScreen extends StatefulWidget {
   final String userId;
@@ -14,6 +18,7 @@ class ControlScreen extends StatefulWidget {
   final String role;
   final String serverBaseUrl; // e.g. http://localhost:3000
   final String token;         // pre-obtained JWT from connect_screen
+  final String? screenSourceId; // macOS display id to share (null = auto-pick)
 
   const ControlScreen({
     super.key,
@@ -22,6 +27,7 @@ class ControlScreen extends StatefulWidget {
     required this.role,
     required this.serverBaseUrl,
     required this.token,
+    this.screenSourceId,
   });
 
   @override
@@ -40,6 +46,16 @@ class _ControlScreenState extends State<ControlScreen> {
   Timer? _statsTimer;
   String? _errorMsg;
 
+  bool _isFullscreen = false;
+  bool _leaving = false;
+  bool _controlEnabled = true; // viewer → controller remote input on/off
+  int _lastButton = 0;         // last pressed mouse button (for up events)
+  Size _remoteBoxSize = const Size(640, 360); // actual on-screen remote video box
+  bool _localFirstFrame = false;  // controller local preview painted a frame
+  bool _remoteFirstFrame = false; // viewer received & painted a remote frame
+  bool _isRemoteMuted = false;    // remote video track reported muted
+  final FocusNode _inputFocus = FocusNode();
+
   @override
   void initState() {
     super.initState();
@@ -50,6 +66,7 @@ class _ControlScreenState extends State<ControlScreen> {
       room: Room(id: widget.roomId, role: widget.role),
       serverBaseUrl: widget.serverBaseUrl,
       token: widget.token,
+      screenSourceId: widget.screenSourceId,
     );
     _connectionManager.addStateListener(_onConnectionStateChange);
     _connectionManager.onRemoteStreamUpdated = _wireRemoteVideo;
@@ -67,6 +84,7 @@ class _ControlScreenState extends State<ControlScreen> {
   @override
   void dispose() {
     _statsTimer?.cancel();
+    _inputFocus.dispose();
     _connectionManager.dispose();
     _remoteRenderer.dispose();
     _localRenderer.dispose();
@@ -74,6 +92,7 @@ class _ControlScreenState extends State<ControlScreen> {
   }
 
   void _onConnectionStateChange(ConnectionState state) {
+    if (_leaving) return; // we've already navigated away / are leaving
     setState(() {
       _connState = state;
       switch (state) {
@@ -102,7 +121,7 @@ class _ControlScreenState extends State<ControlScreen> {
   }
 
   void _wireRemoteVideo([MediaStream? stream]) {
-    if (!mounted) return;
+    if (!mounted || _leaving) return;
     final s = stream ?? _connectionManager.remoteStream;
     if (s != null && _remoteRenderer.srcObject != s) {
       final tracks = s.getTracks();
@@ -119,15 +138,31 @@ class _ControlScreenState extends State<ControlScreen> {
         return;
       }
       _remoteRenderer.srcObject = s;
-      // DEBUG: fires when the first decoded frame actually reaches the renderer.
+      // Fires when the first decoded frame actually reaches the renderer.
       _remoteRenderer.onFirstFrameRendered = () {
         print('Viewer: FIRST FRAME RENDERED — '
             'videoSize=${_remoteRenderer.videoWidth}x${_remoteRenderer.videoHeight}');
-        if (mounted) setState(() {}); // re-layout to the real aspect ratio
+        if (mounted && !_leaving) {
+          _remoteFirstFrame = true;
+          setState(() {}); // re-layout to the real aspect ratio
+        }
       };
-      // DEBUG: track mute tells us if the remote stopped sending media.
+      // Track mute tells us if the remote stopped sending media — surface it
+      // in the HUD so a blank surface can be distinguished from a blue source.
       for (final t in tracks) {
-        t.onMute = () => print('Viewer: track MUTED — kind=${t.kind}');
+        t.onMute = () {
+          print('Viewer: track MUTED — kind=${t.kind}');
+          if (mounted && !_leaving) {
+            _isRemoteMuted = true;
+            setState(() {});
+          }
+        };
+        t.onUnMute = () {
+          if (mounted && !_leaving) {
+            _isRemoteMuted = false;
+            setState(() {});
+          }
+        };
       }
       Future.delayed(const Duration(milliseconds: 500), () {
         print('Viewer: after bind — videoSize='
@@ -140,7 +175,7 @@ class _ControlScreenState extends State<ControlScreen> {
   }
 
   void _wireLocalVideo([MediaStream? stream]) {
-    if (!mounted) return;
+    if (!mounted || _leaving) return;
     final s = stream ?? _connectionManager.localStream;
     if (s != null && _localRenderer.srcObject != s) {
       final tracks = s.getTracks();
@@ -157,11 +192,21 @@ class _ControlScreenState extends State<ControlScreen> {
         return;
       }
       _localRenderer.srcObject = s;
-      // DEBUG: confirms the controller's own capture is producing frames.
+      // Confirms the controller's own capture is producing frames.
       _localRenderer.onFirstFrameRendered = () {
         print('Controller: FIRST FRAME RENDERED (local preview) — '
             'videoSize=${_localRenderer.videoWidth}x${_localRenderer.videoHeight}');
-        if (mounted) setState(() {}); // re-layout to the real aspect ratio
+        if (mounted && !_leaving) {
+          _localFirstFrame = true;
+          // Re-apply the outgoing resolution cap from the REAL captured size
+          // (dynamic resolution) so the chosen display is shared at its true
+          // dimensions rather than the pre-frame estimate.
+          _connectionManager.rescaleOutgoing(
+            width: _localRenderer.videoWidth,
+            height: _localRenderer.videoHeight,
+          );
+          setState(() {}); // re-layout to the real aspect ratio
+        }
       };
       setState(() {});
     }
@@ -190,6 +235,7 @@ class _ControlScreenState extends State<ControlScreen> {
 
   void _startStatsMonitoring() {
     _statsTimer = Timer.periodic(const Duration(seconds: 2), (_) {
+      if (_leaving) return;
       // Try to wire remote/local video if it arrived asynchronously
       _wireRemoteVideo();
       _wireLocalVideo();
@@ -200,9 +246,17 @@ class _ControlScreenState extends State<ControlScreen> {
     });
   }
 
-  void _disconnect() {
+  /// Disconnect and return to the connect screen (instead of popping into a
+  /// black void — ControlScreen was pushReplaced, so there is no route below).
+  Future<void> _disconnect() async {
+    if (_leaving) return;
+    setState(() => _leaving = true);
     _connectionManager.disconnect();
-    if (mounted) Navigator.of(context).pop();
+    if (mounted) {
+      Navigator.of(context).pushReplacement(
+        MaterialPageRoute(builder: (_) => const ConnectScreen()),
+      );
+    }
   }
 
   /// Stop sharing (controller) and return to the connect screen.
@@ -210,18 +264,68 @@ class _ControlScreenState extends State<ControlScreen> {
     _disconnect();
   }
 
+  /// Toggle macOS window full screen via window_manager.
+  Future<void> _toggleFullscreen() async {
+    await WindowManager.instance.ensureInitialized();
+    final fs = await WindowManager.instance.isFullScreen();
+    await WindowManager.instance.setFullScreen(!fs);
+    if (mounted) setState(() => _isFullscreen = !fs);
+  }
+
+  /// Normalize a local pointer position (relative to the video box) to [0..1]
+  /// so it is resolution-independent for the controller's screen.
+  Offset _normalize(Offset local) {
+    final size = _remoteBoxSize;
+    final dx = size.width > 0 ? (local.dx / size.width).clamp(0.0, 1.0) : 0.0;
+    final dy = size.height > 0 ? (local.dy / size.height).clamp(0.0, 1.0) : 0.0;
+    return Offset(dx, dy);
+  }
+
+  /// Map a Flutter pointer button bitmask to a compact index (0 left / 1 right / 2 middle).
+  int _buttonIndex(int buttons) {
+    if (buttons & 0x2 != 0) return 1; // secondary / right
+    if (buttons & 0x4 != 0) return 2; // tertiary / middle
+    return 0;                         // primary / left (default)
+  }
+
+  /// Capture keyboard events and forward the native key code (USB HID usage)
+  /// to the controller, which replays it on its local machine.
+  KeyEventResult _handleKeyEvent(FocusNode node, KeyEvent event) {
+    if (!_controlEnabled || widget.role != 'viewer') return KeyEventResult.ignored;
+    final keyCode = event.physicalKey.usbHidUsage & 0xFFFF;
+    if (event is KeyDownEvent) {
+      _connectionManager.sendInputKey('down', keyCode);
+      return KeyEventResult.handled;
+    } else if (event is KeyUpEvent) {
+      _connectionManager.sendInputKey('up', keyCode);
+      return KeyEventResult.handled;
+    }
+    return KeyEventResult.ignored;
+  }
+
   @override
   Widget build(BuildContext context) {
+    if (_leaving) {
+      return const Scaffold(
+        backgroundColor: Colors.black,
+        body: Center(child: CircularProgressIndicator()),
+      );
+    }
     final isController = widget.role == 'controller';
     return Scaffold(
       backgroundColor: Colors.black,
       body: SafeArea(
-        child: Column(
-          children: [
-            _buildStatusBar(),
-            Expanded(child: _buildMainContent(isController)),
-            _buildToolbar(isController),
-          ],
+        child: Focus(
+          focusNode: _inputFocus,
+          autofocus: true,
+          onKeyEvent: _handleKeyEvent,
+          child: Column(
+            children: [
+              _buildStatusBar(),
+              Expanded(child: _buildMainContent(isController)),
+              _buildToolbar(isController),
+            ],
+          ),
         ),
       ),
     );
@@ -266,74 +370,154 @@ class _ControlScreenState extends State<ControlScreen> {
   }
 
   Widget _buildControllerView() {
-    return Center(child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
-      Container(width: 96, height: 96,
-        decoration: BoxDecoration(color: Colors.deepPurple.withOpacity(0.2), shape: BoxShape.circle),
-        child: Icon(Icons.screen_share_rounded, size: 48, color: Colors.deepPurple[200])),
-      const SizedBox(height: 24),
-      const Text('Screen Sharing Active',
-        style: TextStyle(fontSize: 18, fontWeight: FontWeight.w500, color: Colors.white)),
-      const SizedBox(height: 8),
-      Text('Others can view your screen via ${widget.roomId}',
-        style: const TextStyle(fontSize: 13, color: Colors.white54)),
-      const SizedBox(height: 16),
-      // Local preview so the controller can confirm the screen is being captured.
-      // Sized to the captured display's aspect ratio (handles portrait too).
-      _fitVideoBox(_localRenderer, 640, 360),
-      const SizedBox(height: 24),
-      ElevatedButton.icon(
-        onPressed: _stopSharing,
-        icon: const Icon(Icons.stop_circle_outlined, size: 16),
-        label: const Text('Stop Sharing'),
-        style: ElevatedButton.styleFrom(foregroundColor: Colors.red[300]),
-      ),
-    ]));
+    return Padding(
+      padding: const EdgeInsets.all(16),
+      child: Column(children: [
+        Container(width: 96, height: 96,
+          decoration: BoxDecoration(color: Colors.deepPurple.withOpacity(0.2), shape: BoxShape.circle),
+          child: Icon(Icons.screen_share_rounded, size: 48, color: Colors.deepPurple[200])),
+        const SizedBox(height: 16),
+        const Text('Screen Sharing Active',
+          style: TextStyle(fontSize: 18, fontWeight: FontWeight.w500, color: Colors.white)),
+        const SizedBox(height: 8),
+        Text('Others can view your screen via ${widget.roomId}',
+          style: const TextStyle(fontSize: 13, color: Colors.white54)),
+        const SizedBox(height: 16),
+        // Local preview fills the *remaining* space via Expanded + inner
+        // LayoutBuilder, so it can never overflow regardless of the fixed
+        // chrome above/below. The earlier fixed 160px reserve was too small
+        // and produced "BOTTOM OVERFLOWED BY 85 PIXELS".
+        Expanded(child: LayoutBuilder(builder: (context, constraints) {
+          return Center(child: _fitVideoBox(
+            _localRenderer, constraints.maxWidth, constraints.maxHeight,
+            firstFrame: _localFirstFrame));
+        })),
+        const SizedBox(height: 16),
+        ElevatedButton.icon(
+          onPressed: _stopSharing,
+          icon: const Icon(Icons.stop_circle_outlined, size: 16),
+          label: const Text('Stop Sharing'),
+          style: ElevatedButton.styleFrom(foregroundColor: Colors.red[300]),
+        ),
+      ]),
+    );
   }
 
   Widget _buildViewerView() {
-    return Center(child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
-      // Sized to the remote display's aspect ratio so portrait sources show
-      // tall instead of being squished into a 16:9 box.
-      _fitVideoBox(_remoteRenderer, 640, 360),
-      const SizedBox(height: 16),
-      Text('Watching: ${widget.userId}  |  '
-          'renderer: ${_remoteRenderer.videoWidth}x${_remoteRenderer.videoHeight}  |  '
-          'srcObject: ${_remoteRenderer.srcObject?.id ?? "null"}',
-        style: const TextStyle(fontSize: 11, color: Colors.white38)),
-    ]));
+    return Padding(
+      padding: const EdgeInsets.all(16),
+      child: Column(children: [
+        // Video fills the remaining space (Expanded + inner LayoutBuilder),
+        // so the HUD text below can never push content off-screen.
+        Expanded(child: LayoutBuilder(builder: (context, constraints) {
+          return Center(child: _buildVideoWithInput(_fitVideoBox(
+            _remoteRenderer, constraints.maxWidth, constraints.maxHeight,
+            firstFrame: _remoteFirstFrame)));
+        })),
+        const SizedBox(height: 16),
+        Text('Watching: ${widget.userId}  |  '
+            'renderer: ${_remoteRenderer.videoWidth}x${_remoteRenderer.videoHeight}  |  '
+            '${_remoteFirstFrame ? "frames OK" : "no frames yet"}'
+            '${_isRemoteMuted ? "  |  TRACK MUTED" : ""}',
+          style: const TextStyle(fontSize: 11, color: Colors.white38)),
+        if (!_controlEnabled)
+          const Padding(
+            padding: EdgeInsets.only(top: 8),
+            child: Text('Remote control paused — tap the keyboard icon to resume',
+              style: TextStyle(fontSize: 11, color: Colors.orangeAccent)),
+          ),
+      ]),
+    );
+  }
+
+  /// Wrap the video surface so the viewer can drive the remote machine.
+  /// Only the viewer role forwards input (the server also enforces this).
+  Widget _buildVideoWithInput(Widget video) {
+    return Listener(
+      behavior: HitTestBehavior.opaque,
+      onPointerDown: (e) {
+        if (!_controlEnabled || widget.role != 'viewer') return;
+        final idx = _buttonIndex(e.buttons);
+        _lastButton = idx;
+        final p = _normalize(e.localPosition);
+        _connectionManager.sendInputMouse('down', p.dx, p.dy, button: idx);
+      },
+      onPointerUp: (e) {
+        if (!_controlEnabled || widget.role != 'viewer') return;
+        final p = _normalize(e.localPosition);
+        _connectionManager.sendInputMouse('up', p.dx, p.dy, button: _lastButton);
+      },
+      onPointerMove: (e) {
+        if (!_controlEnabled || widget.role != 'viewer') return;
+        final p = _normalize(e.localPosition);
+        _connectionManager.sendInputMouse('move', p.dx, p.dy);
+      },
+      onPointerSignal: (e) {
+        if (!_controlEnabled || widget.role != 'viewer') return;
+        if (e is PointerScrollEvent) {
+          _connectionManager.sendInputMouse('wheel', 0, 0,
+              delta: e.scrollDelta.dy);
+        }
+      },
+      child: video,
+    );
   }
 
   /// Render a video surface sized to its real aspect ratio, fitting inside a
-  /// max box. This keeps portrait/landscape displays undistorted. The inner
-  /// RTCVideoView uses Fill because the surrounding box already matches the
-  /// video's aspect ratio.
-  Widget _fitVideoBox(RTCVideoRenderer renderer, double maxW, double maxH) {
+  /// max box. The inner RTCVideoView uses Cover because the surrounding box
+  /// already matches the video's aspect ratio.
+  ///
+  /// [firstFrame] is true once the renderer has actually painted a frame;
+  /// while waiting we show an explicit overlay so a *blank* surface is never
+  /// mistaken for "working but blue". The overlay ignores pointer events so
+  /// the viewer can still drive the remote machine while waiting.
+  Widget _fitVideoBox(RTCVideoRenderer renderer, double maxW, double maxH,
+      {bool firstFrame = false}) {
+    final size = _videoBoxSize(renderer, maxW, maxH);
+    if (identical(renderer, _remoteRenderer)) _remoteBoxSize = size;
+    // IMPORTANT: gate on the *real* video dimensions, not the box size
+    // (which is always > 0). The old code keyed `hasSize` off the box, so the
+    // container was permanently blue and the "waiting" hint never appeared.
+    final hasVideo = renderer.videoWidth > 0 && renderer.videoHeight > 0;
+    final waiting = !hasVideo || !firstFrame;
+    return ClipRRect(borderRadius: BorderRadius.circular(12), child: Container(
+      width: size.width,
+      height: size.height,
+      color: hasVideo ? Colors.black : Colors.grey[850],
+      child: Stack(alignment: Alignment.center, children: [
+        RTCVideoView(renderer,
+          objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitCover,
+          mirror: false),
+        if (waiting)
+          IgnorePointer(
+            child: Container(
+              color: Colors.black54,
+              alignment: Alignment.center,
+              child: Text(
+                hasVideo ? 'Rendering first frame…' : 'Waiting for video frames…',
+                style: const TextStyle(color: Colors.yellowAccent, fontSize: 14)),
+            ),
+          ),
+      ]),
+    ));
+  }
+
+  /// Compute the fit box size for [renderer] inside a [maxW]x[maxH] area,
+  /// preserving the real aspect ratio (portrait-aware).
+  Size _videoBoxSize(RTCVideoRenderer renderer, double maxW, double maxH) {
     final vw = renderer.videoWidth;
     final vh = renderer.videoHeight;
-    final hasSize = vw > 0 && vh > 0;
-    double w = maxW, h = maxH;
-    if (hasSize) {
+    if (vw > 0 && vh > 0) {
       final ar = vw / vh;
-      w = maxW;
-      h = w / ar;
+      var w = maxW;
+      var h = w / ar;
       if (h > maxH) {
         h = maxH;
         w = h * ar;
       }
+      return Size(w, h);
     }
-    return ClipRRect(borderRadius: BorderRadius.circular(12), child: Container(
-      width: w,
-      height: h,
-      color: hasSize ? Colors.blue[900] : Colors.grey[850],
-      child: Stack(alignment: Alignment.center, children: [
-        RTCVideoView(renderer,
-          objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitFill,
-          mirror: false),
-        if (!hasSize)
-          const Text('Waiting for video frames...',
-            style: TextStyle(color: Colors.yellowAccent, fontSize: 14)),
-      ]),
-    ));
+    return Size(maxW, maxH);
   }
 
   Widget _buildToolbar(bool isController) {
@@ -341,13 +525,15 @@ class _ControlScreenState extends State<ControlScreen> {
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
       color: Colors.black.withOpacity(0.6),
       child: Row(mainAxisAlignment: MainAxisAlignment.center, children: [
-        IconButton(icon: const Icon(Icons.fullscreen_rounded, size: 20),
-          onPressed: () {}, tooltip: 'Fullscreen', color: Colors.white70),
+        IconButton(icon: Icon(_isFullscreen ? Icons.fullscreen_exit_rounded : Icons.fullscreen_rounded, size: 20),
+          onPressed: _toggleFullscreen, tooltip: 'Fullscreen', color: Colors.white70),
         IconButton(icon: const Icon(Icons.tune_rounded, size: 20),
           onPressed: () {}, tooltip: 'Settings', color: Colors.white70),
         if (!isController)
-          IconButton(icon: const Icon(Icons.keyboard_rounded, size: 20),
-            onPressed: () {}, tooltip: 'Keyboard', color: Colors.white70),
+          IconButton(icon: Icon(_controlEnabled ? Icons.keyboard_rounded : Icons.keyboard_alt_rounded, size: 20),
+            onPressed: () => setState(() => _controlEnabled = !_controlEnabled),
+            tooltip: _controlEnabled ? 'Remote control: ON' : 'Remote control: OFF',
+            color: _controlEnabled ? Colors.greenAccent : Colors.white70),
         const SizedBox(width: 12),
         Text(widget.roomId, style: const TextStyle(fontSize: 11, color: Colors.white38, letterSpacing: 1.2)),
       ]),

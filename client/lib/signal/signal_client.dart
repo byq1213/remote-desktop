@@ -363,12 +363,24 @@ class SignalClient {
     ));
   }
 
-  /// Send key event.
+  /// Send key event (legacy, by key label/code).
   Future<void> sendKeyEvent(
       String key, String code, String action, String roomId) async {
     await _send(SignalMessage(
       type: SignalType.keyEvent,
       payload: {'key': key, 'code': code, 'action': action},
+      roomId: roomId,
+    ));
+  }
+
+  /// Send key event by native key code (macOS virtual keycode).
+  /// The viewer captures [keyCode] from [RawKeyEventMacOS.keyCode] and the
+  /// controller replays it 1:1 on its local machine, avoiding any keymap loss.
+  Future<void> sendKeyEventWithCode(
+      String action, int keyCode, String roomId) async {
+    await _send(SignalMessage(
+      type: SignalType.keyEvent,
+      payload: {'action': action, 'keyCode': keyCode},
       roomId: roomId,
     ));
   }

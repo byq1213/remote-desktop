@@ -14,7 +14,9 @@
 library;
 
 import 'dart:async';
+import 'package:flutter/services.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
+import 'package:screen_retriever/screen_retriever.dart';
 
 import '../models/room.dart';
 import '../signal/signal_client.dart';
@@ -34,6 +36,7 @@ class ConnectionManager {
   final Room room;
   final String serverBaseUrl; // e.g. http://localhost:3000
   final String token;          // pre-obtained JWT
+  final String? screenSourceId; // macOS display id to share (null = auto-pick)
 
   late SignalClient _signal;
   late PeerManager _peer;
@@ -53,6 +56,18 @@ class ConnectionManager {
   MediaStream? _remoteStream;
   MediaStream? get remoteStream => _remoteStream;
 
+  /// Channel to the native (macOS) input simulator that replays incoming
+  /// mouse/keyboard events on the controller's local machine.
+  static const MethodChannel _inputChannel =
+      MethodChannel('remote_desktop/input');
+
+  /// Local display size (logical pixels), used by the controller to map
+  /// normalized viewer coordinates back to screen pixels.
+  Size _localScreenSize = const Size(1920, 1080);
+
+  /// Ensures clean-up runs only once (disconnect() may be followed by dispose()).
+  bool _cleanedUp = false;
+
   /// Local (controller) screen-capture stream, for preview.
   MediaStream? get localStream => _peer.localStream;
 
@@ -64,6 +79,15 @@ class ConnectionManager {
 
   /// Called when screen capture fails to start (e.g. permission denied).
   Function(String)? onCaptureError;
+
+  /// Re-apply the outgoing video resolution cap from the *real* captured size.
+  /// The UI calls this after the local preview paints its first frame so the
+  /// encoder downscales the chosen display's actual resolution (dynamic
+  /// resolution) rather than an estimate.
+  void rescaleOutgoing({int? width, int? height, double maxLongSide = 3840}) {
+    _peer.rescaleOutgoing(
+        width: width, height: height, maxLongSide: maxLongSide);
+  }
 
   /// Build a clean WebSocket URL from a base HTTP(S) URL, stripping any
   /// fragment, query string, or trailing slash that could break the
@@ -84,6 +108,7 @@ class ConnectionManager {
     required this.room,
     required this.serverBaseUrl,
     required this.token,
+    this.screenSourceId,
   }) {
     // Derive WS URL: http://host:3000 → ws://host:3000/signal
     final wsUrl = _buildWsUrl(serverBaseUrl);
@@ -117,6 +142,20 @@ class ConnectionManager {
     }
   }
 
+  /// Read the controller's primary display size so incoming normalized
+  /// viewer coordinates can be mapped to local screen pixels.
+  Future<void> _fetchLocalScreenSize() async {
+    try {
+      final display = await ScreenRetriever.instance.getPrimaryDisplay();
+      _localScreenSize = Size(display.size.width, display.size.height);
+      print('Controller: local screen size = '
+          '${_localScreenSize.width}x${_localScreenSize.height}');
+    } catch (e) {
+      print('Controller: failed to read screen size ($e), '
+          'falling back to $_localScreenSize');
+    }
+  }
+
   // ========== Main Connection Flow ==========
 
   Future<bool> connect(String userId) async {
@@ -140,6 +179,7 @@ class ConnectionManager {
 
       // Setup role-specific resources
       if (room.role == 'controller') {
+        await _fetchLocalScreenSize();
         _setupController();
       } else {
         _setupViewer();
@@ -168,7 +208,7 @@ class ConnectionManager {
   void _setupController() {
     _screenCapture = ScreenCaptureManager();
     _screenCapture!
-        .startCapture(fps: 30, maxWidth: 1920, maxHeight: 1080)
+        .startCapture(fps: 30, sourceId: screenSourceId)
         .then((stream) async {
       _peer.localStream = stream;
       onLocalStreamUpdated?.call(stream);
@@ -189,10 +229,10 @@ class ConnectionManager {
 
   void _setupViewer() {
     _inputHandler = InputEventHandler((event) {
-      if (event is MouseEvent) {
+      if (event is RemoteMouseEvent) {
         _signal.sendMouseEvent(
             event.action, event.x, event.y, event.button, room.id);
-      } else if (event is KeyEvent) {
+      } else if (event is RemoteKeyEvent) {
         _signal.sendKeyEvent(event.key, event.code, event.action, room.id);
       }
     });
@@ -216,6 +256,12 @@ class ConnectionManager {
         break;
       case SignalType.iceCandidate:
         await _onIceCandidate(msg);
+        break;
+      case SignalType.mouseEvent:
+        _onRemoteMouseEvent(msg);
+        break;
+      case SignalType.keyEvent:
+        _onRemoteKeyEvent(msg);
         break;
       case SignalType.peerLeft:
         _onPeerLeft(msg);
@@ -348,6 +394,69 @@ class ConnectionManager {
     _notifyState(ConnectionState.disconnected);
   }
 
+  // ========== Remote Control (controller applies viewer input) ==========
+
+  /// Apply an incoming mouse event on the controller's local machine.
+  /// The viewer sends normalized [0..1] coordinates relative to the video
+  /// box; we scale them to the local display size before replaying.
+  void _onRemoteMouseEvent(SignalMessage msg) {
+    if (room.role != 'controller') return;
+    final payload = msg.payload as Map<String, dynamic>?;
+    if (payload == null) return;
+
+    final action = payload['action'] as String? ?? 'move';
+    final nx = (payload['x'] as num?)?.toDouble() ?? 0;
+    final ny = (payload['y'] as num?)?.toDouble() ?? 0;
+    final button = (payload['button'] as int?) ?? 0;
+    final delta = (payload['delta'] as num?)?.toDouble() ?? 0;
+
+    final px = nx * _localScreenSize.width;
+    final py = ny * _localScreenSize.height;
+
+    print('Controller: apply MOUSE $action @ ($px, $py) button=$button');
+    _inputChannel.invokeMethod('mouse', {
+      'action': action,
+      'x': px,
+      'y': py,
+      'button': button,
+      'delta': delta,
+    }).catchError((e) {
+      print('Controller: failed to dispatch mouse event to native ($e)');
+    });
+  }
+
+  /// Apply an incoming keyboard event on the controller's local machine.
+  void _onRemoteKeyEvent(SignalMessage msg) {
+    if (room.role != 'controller') return;
+    final payload = msg.payload as Map<String, dynamic>?;
+    if (payload == null) return;
+
+    final action = payload['action'] as String? ?? 'down';
+    final keyCode = (payload['keyCode'] as int?) ?? 0;
+
+    print('Controller: apply KEY $action keyCode=$keyCode');
+    _inputChannel.invokeMethod('key', {
+      'action': action,
+      'keyCode': keyCode,
+    }).catchError((e) {
+      print('Controller: failed to dispatch key event to native ($e)');
+    });
+  }
+
+  // ========== Remote Control (viewer sends input) ==========
+
+  /// Send a mouse event to the controller. Coordinates are normalized to
+  /// [0..1] relative to the displayed video so they are resolution-independent.
+  void sendInputMouse(String action, double nx, double ny,
+      {int button = 0, double delta = 0}) {
+    _signal.sendMouseEvent(action, nx, ny, button, room.id);
+  }
+
+  /// Send a keyboard event (by native key code) to the controller.
+  void sendInputKey(String action, int keyCode) {
+    _signal.sendKeyEventWithCode(action, keyCode, room.id);
+  }
+
   void _onRemoteStreamReceived(MediaStream stream) {
     _remoteStream = stream;
     print('Remote video stream received: ${stream.id}');
@@ -364,6 +473,8 @@ class ConnectionManager {
   // ========== Cleanup ==========
 
   void _cleanup() {
+    if (_cleanedUp) return;
+    _cleanedUp = true;
     _signal.removeListener(_onSignalMessage);
     _signal.close();
     _peer.dispose();

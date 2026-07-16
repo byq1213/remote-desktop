@@ -4,9 +4,12 @@ library;
 
 import 'dart:math';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
+import 'package:flutter_webrtc/flutter_webrtc.dart';
 import '../models/config.dart';
+import '../webrtc/screen_capture.dart';
 import 'control_screen.dart';
 
 class ConnectScreen extends StatefulWidget {
@@ -21,6 +24,13 @@ class _ConnectScreenState extends State<ConnectScreen> {
   final _serverController = TextEditingController(text: 'http://localhost:3000');
   final _userIdController = TextEditingController();
   final _roomIdController = TextEditingController();
+
+  // Controller-only: list of shareable displays so the user can pick which
+  // screen to share (essential with an extended display attached).
+  final ScreenCaptureManager _captureProbe = ScreenCaptureManager();
+  List<DesktopCapturerSource> _screens = [];
+  String? _selectedSourceId;
+  bool _loadingScreens = false;
 
   // Honour `--dart-define=MODE=viewer` (see README) so the dedicated
   // viewer window does not default to the controller/sharing role.
@@ -42,6 +52,32 @@ class _ConnectScreenState extends State<ConnectScreen> {
       _roomIdController.text = dateStr;
       _userIdController.text = '${100000 + Random().nextInt(900000)}';
     }
+    // Enumerate shareable displays up-front so the controller can pick one.
+    _loadScreens();
+  }
+
+  /// Enumerate the available screens (macOS). Results populate the Share
+  /// Screen picker. If it fails (e.g. permission not yet granted) we simply
+  /// skip the picker and let ScreenCaptureManager auto-pick the primary.
+  Future<void> _loadScreens() async {
+    if (_loadingScreens) return;
+    setState(() => _loadingScreens = true);
+    try {
+      final screens = await _captureProbe.listScreens();
+      if (mounted) {
+        setState(() {
+          _screens = screens;
+          if (_selectedSourceId == null && screens.isNotEmpty) {
+            _selectedSourceId = screens.first.id;
+          }
+        });
+      }
+    } catch (e) {
+      print('ConnectScreen: listScreens failed: $e');
+      if (mounted) setState(() => _screens = []);
+    } finally {
+      if (mounted) setState(() => _loadingScreens = false);
+    }
   }
 
   @override
@@ -50,6 +86,37 @@ class _ConnectScreenState extends State<ConnectScreen> {
     _userIdController.dispose();
     _roomIdController.dispose();
     super.dispose();
+  }
+
+  /// Picker for the display to share. Shows a spinner while enumerating, a
+  /// hint if none were found, or a dropdown of display names otherwise.
+  Widget _buildScreenPicker() {
+    if (_loadingScreens) {
+      return const SizedBox(
+        height: 20,
+        child: Center(
+          child: SizedBox(
+            width: 18, height: 18,
+            child: CircularProgressIndicator(strokeWidth: 2)),
+        ),
+      );
+    }
+    if (_screens.isEmpty) {
+      return const Text('No displays detected — will auto-pick the primary screen',
+        style: TextStyle(fontSize: 12, color: Colors.white38));
+    }
+    return DropdownButtonFormField<String>(
+      value: _selectedSourceId,
+      decoration: InputDecoration(
+        labelText: 'Display to share',
+        prefixIcon: const Icon(Icons.desktop_windows_outlined),
+        border: OutlineInputBorder(borderRadius: BorderRadius.circular(8)),
+      ),
+      items: _screens
+          .map((s) => DropdownMenuItem(value: s.id, child: Text(s.name)))
+          .toList(),
+      onChanged: (id) => setState(() => _selectedSourceId = id),
+    );
   }
 
   Future<void> _handleConnect() async {
@@ -79,6 +146,7 @@ class _ConnectScreenState extends State<ConnectScreen> {
             role: _selectedRole,
             serverBaseUrl: config.apiUrl,
             token: config.token!,
+            screenSourceId: _selectedSourceId,
           ),
         ),
       );
@@ -209,6 +277,13 @@ class _ConnectScreenState extends State<ConnectScreen> {
                       onSelectionChanged: (Set<String> sel) =>
                           setState(() => _selectedRole = sel.first),
                     ),
+                    if (_selectedRole == 'controller') ...[
+                      const SizedBox(height: 16),
+                      const Text('Share Screen',
+                        style: TextStyle(fontSize: 12, color: Colors.white70)),
+                      const SizedBox(height: 8),
+                      _buildScreenPicker(),
+                    ],
                     const SizedBox(height: 32),
 
                     // Connect button
